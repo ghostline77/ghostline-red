@@ -468,6 +468,14 @@ rebuilt CR2W was byte-identical.
 These figures include process startup and describe one machine and fixture
 set; they are not universal guarantees.
 
+## Geometry-only catalogue previews
+
+Use `mesh-export-batch jobs.json --schema red-schema.json --archives-root <vanilla-archives> --report report.json --geometry-only`
+when preparing neutral geometry previews. This skips material dependency decoding
+and material sidecars. Geometry errors remain fatal per job and are retained in
+the report. `--geometry-only` conflicts with `--material-repo` and `--pbr`;
+the existing material-export mode still requires `--material-repo`.
+
 ## Development
 
 Run the standard checks before submitting changes:

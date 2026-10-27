@@ -222,8 +222,15 @@ enum Command {
         #[arg(long)]
         archives_root: PathBuf,
         /// Shared destination for decoded material dependencies.
-        #[arg(long)]
-        material_repo: PathBuf,
+        #[arg(
+            long,
+            required_unless_present = "geometry_only",
+            conflicts_with = "geometry_only"
+        )]
+        material_repo: Option<PathBuf>,
+        /// Export geometry without decoding materials or creating material sidecars.
+        #[arg(long, conflicts_with = "pbr")]
+        geometry_only: bool,
         /// Machine-readable per-job outcome report.
         #[arg(long)]
         report: PathBuf,
@@ -556,6 +563,7 @@ fn main() -> Result<()> {
             schema,
             archives_root,
             material_repo,
+            geometry_only,
             report,
             pbr,
             pbr_size,
@@ -571,7 +579,9 @@ fn main() -> Result<()> {
             } else {
                 threads
             };
-            eprintln!("exporting {job_count} jobs with {thread_count} threads");
+            eprintln!(
+                "exporting {job_count} jobs with {thread_count} threads (geometry only: {geometry_only})"
+            );
             let pool = ThreadPoolBuilder::new().num_threads(thread_count).build()?;
             let completed = AtomicUsize::new(0);
             let fatal_completed = AtomicUsize::new(0);
@@ -585,7 +595,7 @@ fn main() -> Result<()> {
                             &job,
                             &schema,
                             &archives,
-                            &material_repo,
+                            material_repo.as_deref(),
                             cli.kraken.as_os_str(),
                             pbr,
                             pbr_size,
@@ -702,7 +712,7 @@ fn run_mesh_export_batch_job(
     job: &MeshExportBatchJob,
     schema: &schema::RedSchema,
     archives: &material::ArchiveSet,
-    material_repo: &Path,
+    material_repo: Option<&Path>,
     kraken_path: &std::ffi::OsStr,
     pbr: bool,
     pbr_size: u32,
@@ -723,6 +733,10 @@ fn run_mesh_export_batch_job(
     let input = match geometry {
         Ok(input) => input,
         Err(error) => return fatal_mesh_export_error(&error),
+    };
+
+    let Some(material_repo) = material_repo else {
+        return MeshExportBatchErrors::default();
     };
 
     let sidecar = job.output.with_extension("Material.json");
@@ -911,6 +925,61 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geometry_only_batch_does_not_require_material_repository() {
+        let cli = Cli::try_parse_from([
+            "ghostline-red",
+            "mesh-export-batch",
+            "jobs.json",
+            "--schema",
+            "schema.json",
+            "--archives-root",
+            "archives",
+            "--report",
+            "report.json",
+            "--geometry-only",
+        ]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn geometry_only_batch_rejects_material_options() {
+        for option in [vec!["--pbr"], vec!["--material-repo", "materials"]] {
+            let mut args = vec![
+                "ghostline-red",
+                "mesh-export-batch",
+                "jobs.json",
+                "--schema",
+                "schema.json",
+                "--archives-root",
+                "archives",
+                "--report",
+                "report.json",
+                "--geometry-only",
+            ];
+            args.extend(option);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn material_batch_still_requires_material_repository() {
+        assert!(
+            Cli::try_parse_from([
+                "ghostline-red",
+                "mesh-export-batch",
+                "jobs.json",
+                "--schema",
+                "schema.json",
+                "--archives-root",
+                "archives",
+                "--report",
+                "report.json"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn batch_manifest_accepts_job_without_appearance() {
