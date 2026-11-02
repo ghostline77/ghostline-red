@@ -1,4 +1,4 @@
-//! Template-backed generic CR2W writer.
+//! Generic CR2W writer using JSON and RED reflection metadata.
 
 use crate::{
     archive::{self, ArchiveError},
@@ -35,7 +35,7 @@ pub enum WriterError {
     Cr2w(#[from] Cr2wError),
     #[error("invalid WKit JSON: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("unsupported template-backed write: {0}")]
+    #[error("unsupported CR2W write: {0}")]
     Unsupported(String),
     #[error("CR2W output exceeds 32-bit offsets")]
     TooLarge,
@@ -108,6 +108,10 @@ struct Encoder<'a> {
     schema: &'a BTreeMap<String, schema::RedClass>,
     enums: Option<&'a BTreeSet<String>>,
     bitfields: Option<&'a BTreeSet<String>>,
+    document_chunks: RefCell<Vec<Value>>,
+    created_buffers: RefCell<Vec<(u32, Vec<u8>)>>,
+    created_buffer_ids: RefCell<HashMap<String, usize>>,
+    package: bool,
 }
 
 /// Writes WKit-shaped JSON using an existing CR2W resource as its audited
@@ -279,6 +283,10 @@ fn write_with_schema(
         schema,
         enums,
         bitfields,
+        document_chunks: RefCell::new(vec![]),
+        created_buffers: RefCell::new(vec![]),
+        created_buffer_ids: RefCell::new(HashMap::new()),
+        package: false,
     };
     // Seed discovery with every authored handle definition. Template-shaped
     // traversal can skip handles that only become reachable after array
@@ -473,6 +481,384 @@ fn read_json(path: &Path) -> Result<Value, WriterError> {
     Ok(Value::deserialize(deserializer)?)
 }
 
+impl<'a> Encoder<'a> {
+    fn new_document(
+        file: &'a Cr2wInspection,
+        classes: &'a BTreeSet<String>,
+        schema: &'a RedSchema,
+        package: bool,
+    ) -> Self {
+        Self {
+            template: &[],
+            file,
+            names: RefCell::new(HashMap::from([("None".into(), 0)])),
+            new_names: RefCell::new(vec!["None".into()]),
+            imports: RefCell::new(HashMap::new()),
+            new_imports: RefCell::new(vec![]),
+            used_imports: RefCell::new(HashSet::new()),
+            handle_exports: RefCell::new(HashMap::new()),
+            export_remap: RefCell::new(HashMap::new()),
+            claimed_exports: RefCell::new(HashSet::new()),
+            candidate_handles: RefCell::new(HashSet::new()),
+            discovering_handles: Cell::new(false),
+            classes,
+            schema: &schema.classes,
+            enums: Some(&schema.enums),
+            bitfields: Some(&schema.bitfields),
+            document_chunks: RefCell::new(vec![]),
+            created_buffers: RefCell::new(vec![]),
+            created_buffer_ids: RefCell::new(HashMap::new()),
+            package,
+        }
+    }
+    fn reflected_fields(&self, value: &Value) -> Result<Vec<(String, String, Value)>, WriterError> {
+        let kind = kind(value)?;
+        let mut fields = vec![];
+        for (name, value) in value
+            .as_object()
+            .ok_or_else(|| unsupported("class object"))?
+        {
+            if let Some(property) = class_property(self.schema, kind, name) {
+                fields.push((
+                    property.ordinal.unwrap_or(u32::MAX),
+                    name.clone(),
+                    self.property_type(property).ok_or_else(|| {
+                        unsupported(format!("property type {kind}.{name}: {}", property.cs_type))
+                    })?,
+                    value.clone(),
+                ));
+            }
+        }
+        fields.sort_by_key(|f| f.0);
+        Ok(fields.into_iter().map(|(_, n, t, v)| (n, t, v)).collect())
+    }
+    fn discover_class_handles(&self, value: &Value) -> Result<(), WriterError> {
+        for (name, t, v) in self.reflected_fields(value)? {
+            self.discover_value_handles(&v, &t).map_err(|e| {
+                unsupported(format!("{}.{}: {e}", kind(value).unwrap_or("?"), name))
+            })?;
+        }
+        if kind(value)? == "worldStreamingSector" {
+            for node in array(value, "nodes")? {
+                self.discover_value_handles(node, "handle:worldNode")?;
+            }
+        }
+        Ok(())
+    }
+    fn discover_value_handles(&self, value: &Value, t: &str) -> Result<(), WriterError> {
+        if t.starts_with("handle:") || t.starts_with("whandle:") {
+            if let (Some(id), Some(data)) = (
+                value.get("HandleId").and_then(Value::as_str),
+                value.get("Data"),
+            ) {
+                let existing = self.handle_exports.borrow().get(id).copied();
+                if let Some(index) = existing {
+                    if self.document_chunks.borrow()[index] != *data {
+                        return Err(unsupported("conflicting handle definition"));
+                    }
+                } else {
+                    self.handle_exports
+                        .borrow_mut()
+                        .insert(id.into(), self.document_chunks.borrow().len());
+                    self.document_chunks.borrow_mut().push(data.clone());
+                    self.discover_class_handles(data)?;
+                }
+            }
+        } else if let Some(inner) = t.strip_prefix("array:") {
+            if value.is_null() {
+                return Ok(());
+            }
+            for child in value
+                .as_array()
+                .or_else(|| value.get("Elements").and_then(Value::as_array))
+                .ok_or_else(|| unsupported("array"))?
+            {
+                self.discover_value_handles(child, inner)?;
+            }
+        } else if self.classes.contains(t) && value.is_object() {
+            let mut typed = value.clone();
+            if typed.get("$type").is_none() {
+                typed["$type"] = Value::String(t.into());
+            }
+            self.discover_class_handles(&typed)?;
+        }
+        Ok(())
+    }
+    fn encode_buffer(&self, v: &Value) -> Result<Option<usize>, WriterError> {
+        let id = v
+            .get("BufferId")
+            .or_else(|| v.get("BufferRefId"))
+            .and_then(Value::as_str);
+        if let Some(index) = id.and_then(|id| self.created_buffer_ids.borrow().get(id).copied()) {
+            return Ok(Some(index));
+        }
+        let bytes = if v
+            .get("Type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.contains("RedPackage"))
+        {
+            self.encode_package(v.get("Data").ok_or_else(|| unsupported("package Data"))?)?
+        } else if let Some(entries) = v
+            .pointer("/Data/Data")
+            .or_else(|| v.get("Data"))
+            .and_then(Value::as_array)
+        {
+            encode_world_node_buffer(entries)?
+        } else if let Some(bytes) = v.get("Bytes").and_then(Value::as_str) {
+            STANDARD.decode(bytes)?
+        } else if id.is_none() {
+            return Ok(None);
+        } else {
+            return Err(unsupported("buffer payload"));
+        };
+        let index = self.created_buffers.borrow().len();
+        self.created_buffers.borrow_mut().push((
+            v.get("Flags").and_then(Value::as_u64).unwrap_or(0) as u32,
+            bytes,
+        ));
+        if let Some(id) = id {
+            self.created_buffer_ids
+                .borrow_mut()
+                .insert(id.into(), index);
+        }
+        Ok(Some(index))
+    }
+    fn encode_sector_appendix(&self, v: &Value) -> Result<Vec<u8>, WriterError> {
+        let index = self
+            .encode_buffer(v.get("nodeData").ok_or_else(|| unsupported("nodeData"))?)?
+            .ok_or_else(|| unsupported("nodeData buffer"))?;
+        let mut out = (v.get("version").and_then(Value::as_i64).unwrap_or(1) as i32)
+            .to_le_bytes()
+            .to_vec();
+        out.extend(0_u32.to_le_bytes());
+        out.extend((u32n(index)? + 0x8000_0001).to_le_bytes());
+        let nodes = array(v, "nodes")?;
+        write_positive_vlq(&mut out, u32n(nodes.len())?);
+        for n in nodes {
+            out.extend(self.encode_new_value(n, "handle:worldNode")?);
+        }
+        let refs = array(v, "nodeRefs")?;
+        write_positive_vlq(&mut out, u32n(refs.len())?);
+        for r in refs {
+            out.extend(encode_string(node_ref_value(r)?)?);
+        }
+        let variants = array(v, "variantIndices")?;
+        write_positive_vlq(&mut out, u32n(variants.len())?);
+        for n in variants {
+            out.extend((json_i64(n)? as i32).to_le_bytes());
+        }
+        out.extend(
+            (v.get("persistentNodeIndex")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1) as i32)
+                .to_le_bytes(),
+        );
+        let size = u32n(out.len() - 4)?;
+        write_u32_at(&mut out, 4, size)?;
+        Ok(out)
+    }
+    fn encode_package(&self, v: &Value) -> Result<Vec<u8>, WriterError> {
+        let schema = RedSchema {
+            classes: self.schema.clone(),
+            enums: self.enums.cloned().unwrap_or_default(),
+            bitfields: self.bitfields.cloned().unwrap_or_default(),
+            ..RedSchema::default()
+        };
+        let e = Encoder::new_document(self.file, self.classes, &schema, true);
+        *e.document_chunks.borrow_mut() = array(v, "Chunks")?.to_vec();
+        let roots = e.document_chunks.borrow().clone();
+        for chunk in roots {
+            e.discover_class_handles(&chunk)?;
+        }
+        let mut data = vec![];
+        let mut offsets = vec![];
+        let mut types = vec![];
+        for chunk in e.document_chunks.borrow().clone() {
+            offsets.push(data.len());
+            types.push(e.name_index(kind(&chunk)?)?);
+            data.extend(e.encode_new_class(&chunk, kind(&chunk)?)?);
+        }
+        let names = e.new_names.borrow();
+        let imports = e.new_imports.borrow();
+        let mut out = vec![4, 0, 7, 0];
+        out.extend(u32n(array(v, "Chunks")?.len())?.to_le_bytes());
+        out.resize(32, 0);
+        out.extend((v.get("CruidIndex").and_then(Value::as_i64).unwrap_or(0) as i16).to_le_bytes());
+        let cruids = v.get("CruidDict").and_then(Value::as_object);
+        let count = cruids.map_or(0, |d| d.len());
+        out.extend(
+            u16::try_from(count)
+                .map_err(|_| WriterError::TooLarge)?
+                .to_le_bytes(),
+        );
+        for i in 0..count {
+            let c = cruids
+                .and_then(|d| d.get(&i.to_string()))
+                .and_then(Value::as_str)
+                .ok_or_else(|| unsupported("package CRUID"))?
+                .parse::<u64>()
+                .map_err(|_| unsupported("package CRUID"))?;
+            out.extend(c.to_le_bytes());
+        }
+        let base = out.len();
+        let mut sections = vec![];
+        sections.push(u32n(out.len() - base)?);
+        let start = out.len();
+        out.resize(start + imports.len() * 4, 0);
+        sections.push(u32n(out.len() - base)?);
+        for (i, import) in imports.iter().enumerate() {
+            let bytes = import.depot_path.as_bytes();
+            let descriptor = u32n(out.len() - base)?
+                | (u32n(bytes.len())? << 23)
+                | (u32::from(import.flags & 5 != 0) << 31);
+            write_u32_at(&mut out, start + i * 4, descriptor)?;
+            out.extend(bytes);
+        }
+        sections.push(u32n(out.len() - base)?);
+        let start = out.len();
+        out.resize(start + names.len() * 4, 0);
+        sections.push(u32n(out.len() - base)?);
+        for (i, name) in names.iter().enumerate() {
+            let descriptor = u32n(out.len() - base)? | (u32n(name.len() + 1)? << 24);
+            write_u32_at(&mut out, start + i * 4, descriptor)?;
+            out.extend(name.as_bytes());
+            out.push(0);
+        }
+        sections.push(u32n(out.len() - base)?);
+        let start = out.len();
+        out.resize(start + types.len() * 8, 0);
+        sections.push(u32n(out.len() - base)?);
+        let data_start = out.len() - base;
+        for (i, t) in types.iter().enumerate() {
+            write_u32_at(&mut out, start + i * 8, u32::from(*t))?;
+            write_u32_at(&mut out, start + i * 8 + 4, u32n(data_start + offsets[i])?)?;
+        }
+        out.extend(data);
+        for (i, n) in sections.iter().enumerate() {
+            write_u32_at(&mut out, 8 + i * 4, *n)?;
+        }
+        redpackage::decode(
+            &out,
+            self.classes,
+            PackageSettings {
+                imports_as_hash: false,
+                handle_id_base: 0,
+                enums: self.enums,
+                bitfields: self.bitfields,
+            },
+        )?;
+        Ok(out)
+    }
+    fn encode_container(&self, document: &Value) -> Result<Vec<u8>, WriterError> {
+        if document
+            .pointer("/Data/EmbeddedFiles")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+        {
+            return Err(unsupported("embedded files"));
+        }
+        let mut chunks = vec![];
+        let mut types = vec![];
+        for value in self.document_chunks.borrow().clone() {
+            types.push(self.name_index(kind(&value)?)?);
+            chunks.push(self.encode_new_class(&value, kind(&value)?)?);
+        }
+        let names = self.new_names.borrow();
+        let imports = self.new_imports.borrow();
+        let mut tables: Vec<Vec<u8>> = vec![vec![]; 10];
+        let (strings, name_table) = document_name_tables(&names)?;
+        tables[0] = strings;
+        tables[1] = name_table;
+        for import in imports.iter() {
+            let offset = u32n(tables[0].len())?;
+            tables[2].extend(offset.to_le_bytes());
+            tables[2].extend(0_u16.to_le_bytes());
+            tables[2].extend(import.flags.to_le_bytes());
+            tables[0].extend(import.depot_path.as_bytes());
+            tables[0].push(0);
+        }
+        // WolvenKit writes one zeroed CR2WPropertyInfo even without properties.
+        tables[3].resize(16, 0);
+        tables[4].resize(chunks.len() * 24, 0);
+        tables[5].resize(self.created_buffers.borrow().len() * 24, 0);
+        let mut out = vec![0; 160];
+        out[..4].copy_from_slice(b"CR2W");
+        write_u32_at(&mut out, 4, 195)?;
+        // This header value is the CR2W table count, not the export count.
+        write_u32_at(&mut out, 36, 6)?;
+        let mut offsets = [0; 10];
+        let sizes = [1, 8, 8, 16, 24, 24, 16, 1, 1, 1];
+        for i in 0..10 {
+            if tables[i].is_empty() {
+                continue;
+            }
+            offsets[i] = out.len();
+            write_u32_at(&mut out, 40 + i * 12, u32n(offsets[i])?)?;
+            write_u32_at(&mut out, 44 + i * 12, u32n(tables[i].len() / sizes[i])?)?;
+            out.extend(&tables[i]);
+        }
+        for (i, bytes) in chunks.iter().enumerate() {
+            let start = out.len();
+            out.extend(bytes);
+            let p = offsets[4] + i * 24;
+            out[p..p + 2].copy_from_slice(&types[i].to_le_bytes());
+            write_u32_at(&mut out, p + 8, u32n(bytes.len())?)?;
+            write_u32_at(&mut out, p + 12, u32n(start)?)?;
+            // WolvenKit leaves CR2W export CRC fields zero in newly written files.
+            write_u32_at(&mut out, p + 20, 0)?;
+        }
+        let objects_end = u32n(out.len())?;
+        write_u32_at(&mut out, 24, objects_end)?;
+        for (i, (flags, bytes)) in self.created_buffers.borrow().iter().enumerate() {
+            let start = out.len();
+            out.extend(bytes);
+            let p = offsets[5] + i * 24;
+            for (j, n) in [
+                *flags,
+                u32n(i)?,
+                u32n(start)?,
+                u32n(bytes.len())?,
+                u32n(bytes.len())?,
+                crc32fast::hash(bytes),
+            ]
+            .iter()
+            .enumerate()
+            {
+                write_u32_at(&mut out, p + j * 4, *n)?;
+            }
+        }
+        let end = u32n(out.len())?;
+        write_u32_at(&mut out, 28, end)?;
+        for i in 0..10 {
+            if !tables[i].is_empty() {
+                let crc = crc32fast::hash(&out[offsets[i]..offsets[i] + tables[i].len()]);
+                write_u32_at(&mut out, 48 + i * 12, crc)?;
+            }
+        }
+        let crc = calculate_header_crc(&out)?;
+        write_u32_at(&mut out, 32, crc)?;
+        Ok(out)
+    }
+}
+
+fn document_name_tables(names: &[String]) -> Result<(Vec<u8>, Vec<u8>), WriterError> {
+    if names.first().map(String::as_str) != Some("None") {
+        return Err(unsupported("CName table must begin with None"));
+    }
+    let mut strings = Vec::new();
+    let mut name_table = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        name_table.extend(u32n(strings.len())?.to_le_bytes());
+        name_table.extend(short_cname_hash(name).to_le_bytes());
+        // Offset zero is the empty sentinel; the next string starts at one.
+        if index != 0 {
+            strings.extend(name.as_bytes());
+        }
+        strings.push(0);
+    }
+    Ok((strings, name_table))
+}
+
 impl Encoder<'_> {
     #[expect(
         clippy::too_many_lines,
@@ -621,115 +1007,275 @@ impl Encoder<'_> {
         Ok((output, cursor))
     }
 
-    fn encode_new_value(&self, value: &Value, red_type: &str) -> Result<Vec<u8>, WriterError> {
-        match red_type {
-            "Bool" => Ok(vec![u8::from(json_bool(value)?)]),
-            "Int8" => Ok(i8::try_from(json_i64(value)?)
+    fn encode_new_value(&self, v: &Value, t: &str) -> Result<Vec<u8>, WriterError> {
+        if self.package && t == "LocalizationString" {
+            let mut bytes = json_string_u64(
+                v.get("unk1")
+                    .ok_or_else(|| unsupported("LocalizationString.unk1"))?,
+            )?
+            .to_le_bytes()
+            .to_vec();
+            bytes.extend(
+                self.encode_new_value(
+                    v.get("value")
+                        .ok_or_else(|| unsupported("LocalizationString.value"))?,
+                    "String",
+                )?,
+            );
+            return Ok(bytes);
+        }
+        if let Some((capacity, inner)) = split_fixed_array_type(t) {
+            let elements = v
+                .get("Elements")
+                .ok_or_else(|| unsupported("fixed array elements"))?;
+            if elements.as_array().is_none_or(|a| a.len() > capacity) {
+                return Err(unsupported("fixed array capacity"));
+            }
+            return self.encode_new_value(elements, &format!("array:{inner}"));
+        }
+
+        if self.bitfields.is_some_and(|types| types.contains(t)) {
+            if self.package {
+                let mut out = vec![];
+                let names = v
+                    .as_str()
+                    .ok_or_else(|| unsupported("bitfield"))?
+                    .split(", ")
+                    .filter(|s| !s.is_empty() && *s != "0")
+                    .collect::<Vec<_>>();
+                out.push(u8::try_from(names.len()).map_err(|_| WriterError::TooLarge)?);
+                for name in names {
+                    out.extend(self.name_index(name)?.to_le_bytes());
+                }
+                return Ok(out);
+            }
+            return self.encode_bitfield(v);
+        }
+
+        if let Some(inner) = t.strip_prefix("array:") {
+            if v.is_null() {
+                return Ok(0_u32.to_le_bytes().to_vec());
+            }
+            let a = v.as_array().ok_or_else(|| unsupported("array"))?;
+            let mut out = u32n(a.len())?.to_le_bytes().to_vec();
+            for child in a {
+                out.extend(self.encode_new_value(child, inner)?);
+            }
+            return Ok(out);
+        }
+        if t.starts_with("handle:") || t.starts_with("whandle:") {
+            let null = if self.package { u32::MAX } else { 0 };
+            if v.is_null() {
+                return Ok(null.to_le_bytes().to_vec());
+            }
+            let id = v
+                .get("HandleId")
+                .or_else(|| v.get("HandleRefId"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| unsupported("handle identity"))?;
+            let pointer = match self.handle_exports.borrow().get(id) {
+                Some(i) => u32n(*i)? + u32::from(!self.package),
+                None if id == "-1" || id == "0" => null,
+                None => return Err(unsupported(format!("unresolved handle {id}"))),
+            };
+            return Ok(pointer.to_le_bytes().to_vec());
+        }
+        if matches!(
+            t,
+            "DataBuffer" | "serializationDeferredDataBuffer" | "SharedDataBuffer"
+        ) {
+            if self.package || t == "SharedDataBuffer" {
+                let bytes =
+                    STANDARD.decode(v.get("Bytes").and_then(Value::as_str).unwrap_or(""))?;
+                let mut out = u32n(bytes.len())?.to_le_bytes().to_vec();
+                out.extend(bytes);
+                return Ok(out);
+            }
+            let Some(index) = self.encode_buffer(v)? else {
+                return Ok(if t == "DataBuffer" {
+                    0_u32.to_le_bytes().to_vec()
+                } else {
+                    0_u16.to_le_bytes().to_vec()
+                });
+            };
+            return Ok(if t == "DataBuffer" {
+                (u32n(index)? + 0x8000_0001).to_le_bytes().to_vec()
+            } else {
+                u16::try_from(index + 1)
+                    .map_err(|_| WriterError::TooLarge)?
+                    .to_le_bytes()
+                    .to_vec()
+            });
+        }
+        if self.package && matches!(t, "String" | "NodeRef") {
+            let text = if t == "String" {
+                v.as_str()
+            } else {
+                Some(node_ref_value(v)?)
+            }
+            .ok_or_else(|| unsupported("package string"))?;
+            let mut out = u16::try_from(text.len())
+                .map_err(|_| WriterError::TooLarge)?
+                .to_le_bytes()
+                .to_vec();
+            out.extend(text.as_bytes());
+            return Ok(out);
+        }
+        if t.starts_with("rRef:") || t.starts_with("raRef:") {
+            let encoded = self.encode_value(v, t, 0, 0, &mut HashMap::new())?.0;
+            if self.package {
+                let index =
+                    u16::from_le_bytes(encoded[..2].try_into().map_err(|_| unsupported("import"))?);
+                return Ok((if index == 0 { u16::MAX } else { index - 1 })
+                    .to_le_bytes()
+                    .to_vec());
+            }
+            return Ok(encoded);
+        }
+        if self.classes.contains(t) && !matches!(t, "gamedataLocKeyWrapper" | "LocalizationString")
+        {
+            return self.encode_new_class(v, t);
+        }
+        match t {
+            "Bool" => Ok(vec![u8::from(json_bool(v)?)]),
+            "Int8" => Ok(i8::try_from(json_i64(v)?)
                 .map_err(|_| unsupported("Int8 range"))?
                 .to_le_bytes()
                 .to_vec()),
             "Uint8" => Ok(vec![
-                u8::try_from(json_u64(value)?).map_err(|_| unsupported("Uint8 range"))?,
+                u8::try_from(json_u64(v)?).map_err(|_| unsupported("Uint8 range"))?,
             ]),
-            "Int16" => Ok(i16::try_from(json_i64(value)?)
+            "Int16" => Ok(i16::try_from(json_i64(v)?)
                 .map_err(|_| unsupported("Int16 range"))?
                 .to_le_bytes()
                 .to_vec()),
-            "Uint16" => Ok(u16::try_from(json_u64(value)?)
+            "Uint16" => Ok(u16::try_from(json_u64(v)?)
                 .map_err(|_| unsupported("Uint16 range"))?
                 .to_le_bytes()
                 .to_vec()),
-            "Int32" => Ok(i32::try_from(json_i64(value)?)
+            "Int32" => Ok(i32::try_from(json_i64(v)?)
                 .map_err(|_| unsupported("Int32 range"))?
                 .to_le_bytes()
                 .to_vec()),
-            "Uint32" => Ok(u32::try_from(json_u64(value)?)
+            "Uint32" => Ok(u32::try_from(json_u64(v)?)
                 .map_err(|_| unsupported("Uint32 range"))?
                 .to_le_bytes()
                 .to_vec()),
-            "Int64" => Ok(json_string_i64(value)?.to_le_bytes().to_vec()),
-            "Uint64" | "CRUID" | "CDateTime" => Ok(json_string_u64(value)?.to_le_bytes().to_vec()),
-            "Float" => Ok(json_f32(value)?.to_le_bytes().to_vec()),
-            "Double" => Ok(json_f64(value)?.to_le_bytes().to_vec()),
-            "CName" => Ok(self
-                .name_index(storage_value(value)?)?
-                .to_le_bytes()
-                .to_vec()),
-            "String" => encode_string(value.as_str().ok_or_else(|| unsupported("String value"))?),
-            "NodeRef" => encode_string(node_ref_value(value)?),
-            "TweakDBID" => Ok(tweak_db_id(storage_or_string(value)?)?
-                .to_le_bytes()
-                .to_vec()),
+            "Int64" => Ok(json_string_i64(v)?.to_le_bytes().to_vec()),
+            "Uint64" | "CRUID" | "CDateTime" => Ok(json_string_u64(v)?.to_le_bytes().to_vec()),
+            "Float" => Ok(json_f32(v)?.to_le_bytes().to_vec()),
+            "Double" => Ok(json_f64(v)?.to_le_bytes().to_vec()),
+            "CName" => Ok(self.name_index(storage_value(v)?)?.to_le_bytes().to_vec()),
+            "String" => encode_string(v.as_str().ok_or_else(|| unsupported("String v"))?),
+            "NodeRef" => encode_string(node_ref_value(v)?),
+            "TweakDBID" => Ok(tweak_db_id(storage_or_string(v)?)?.to_le_bytes().to_vec()),
             "LocalizationString" | "gamedataLocKeyWrapper" => self
-                .encode_value(value, red_type, 0, 0, &mut HashMap::new())
+                .encode_value(v, t, 0, 0, &mut HashMap::new())
                 .map(|(bytes, _)| bytes),
-            _ if red_type.starts_with("array:") => {
-                let values = value.as_array().ok_or_else(|| unsupported("array value"))?;
-                let inner = &red_type[6..];
-                let mut output = u32::try_from(values.len())
+            _ if t.starts_with("array:") => {
+                let vs = v.as_array().ok_or_else(|| unsupported("array v"))?;
+                let inner = &t[6..];
+                let mut output = u32::try_from(vs.len())
                     .map_err(|_| WriterError::TooLarge)?
                     .to_le_bytes()
                     .to_vec();
-                for value in values {
-                    output.extend_from_slice(&self.encode_new_value(value, inner)?);
+                for v in vs {
+                    output.extend_from_slice(&self.encode_new_value(v, inner)?);
                 }
                 Ok(output)
             }
-            _ if red_type.starts_with("rRef:") || red_type.starts_with("raRef:") => self
-                .encode_value(value, red_type, 0, 0, &mut HashMap::new())
+            _ if t.starts_with("rRef:") || t.starts_with("raRef:") => self
+                .encode_value(v, t, 0, 0, &mut HashMap::new())
                 .map(|(bytes, _)| bytes),
-            _ if self.classes.contains(red_type) => self.encode_new_class(value, red_type),
-            _ if value.is_string() => Ok(self
+            _ if self.classes.contains(t) => self.encode_new_class(v, t),
+            _ if v.is_string() => Ok(self
                 .name_index(normalize_wolvenkit_enum_name(
-                    value
-                        .as_str()
-                        .ok_or_else(|| unsupported(format!("{red_type} enum")))?,
+                    v.as_str().ok_or_else(|| unsupported(format!("{t} enum")))?,
                 ))?
                 .to_le_bytes()
                 .to_vec()),
             _ => Err(unsupported(format!(
-                "cannot synthesize missing property type {red_type}"
+                "cannot synthesize missing property type {t}"
             ))),
         }
     }
 
     fn encode_new_class(&self, value: &Value, red_type: &str) -> Result<Vec<u8>, WriterError> {
-        let object = value
-            .as_object()
-            .ok_or_else(|| unsupported(format!("{red_type} is not an object")))?;
-        let mut properties = Vec::new();
-        for (name, value) in object {
-            if name == "$type" {
-                continue;
-            }
-            if is_default_missing_value(value, "") {
-                continue;
-            }
-            let property = class_property(self.schema, red_type, name)
-                .ok_or_else(|| unsupported(format!("unknown property {red_type}.{name}")))?;
-            let property_type = self
-                .property_type(property)
-                .ok_or_else(|| unsupported(format!("unsupported property {red_type}.{name}")))?;
-            if is_default_missing_value(value, &property_type) {
-                continue;
-            }
-            let payload = self.encode_new_value(value, &property_type)?;
-            properties.push((
-                property.ordinal.unwrap_or(u32::MAX),
-                encode_property(
-                    self.name_index(name)?,
-                    self.name_index(&property_type)?,
-                    &payload,
-                )?,
-            ));
+        let mut typed = value.clone();
+        if typed.get("$type").is_none() {
+            typed["$type"] = Value::String(red_type.into());
         }
-        properties.sort_by_key(|(ordinal, _)| *ordinal);
-        let mut output = vec![0];
-        for (_, property) in properties {
-            output.extend_from_slice(&property);
+        let value = &typed;
+        let t = red_type;
+        if t == "AreaShapeOutline" && !self.package {
+            return area_shape_outline_buffer(value);
         }
-        output.extend_from_slice(&0_u16.to_le_bytes());
-        Ok(output)
+        if is_opaque_custom_data(t) {
+            return STANDARD
+                .decode(
+                    value
+                        .get("$rawData")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| unsupported(t))?,
+                )
+                .map_err(Into::into);
+        }
+        let mut fields = vec![];
+        for (name, mut t, v) in self.reflected_fields(value)? {
+            if v.is_null() && self.classes.contains(&t) {
+                continue;
+            }
+            if let Some(elements) = v.get("Elements").and_then(Value::as_array) {
+                if let Some(inner) = t.strip_prefix("array:") {
+                    t = format!("[{}]{inner}", elements.len());
+                }
+            }
+            let payload = self.encode_new_value(&v, &t).map_err(|e| {
+                unsupported(format!("{}.{}: {e}", kind(value).unwrap_or("?"), name))
+            })?;
+            fields.push((self.name_index(&name)?, self.name_index(&t)?, payload));
+        }
+        let mut out;
+        if self.package {
+            out = vec![0; 2 + fields.len() * 8];
+            out[..2].copy_from_slice(
+                &u16::try_from(fields.len())
+                    .map_err(|_| WriterError::TooLarge)?
+                    .to_le_bytes(),
+            );
+            for (i, (n, t, bytes)) in fields.into_iter().enumerate() {
+                let p = 2 + i * 8;
+                out[p..p + 2].copy_from_slice(&n.to_le_bytes());
+                out[p + 2..p + 4].copy_from_slice(&t.to_le_bytes());
+                let offset = u32n(out.len())?;
+                write_u32_at(&mut out, p + 4, offset)?;
+                out.extend(bytes);
+            }
+        } else {
+            out = vec![0];
+            for (n, t, bytes) in fields {
+                out.extend(encode_property(n, t, &bytes)?);
+            }
+            out.extend(0_u16.to_le_bytes());
+            if t == "worldStreamingSector" {
+                out.extend(self.encode_sector_appendix(value)?);
+            }
+            if let Some(tail) = value.get("$rawTail").and_then(Value::as_str) {
+                out.extend(STANDARD.decode(tail)?);
+            }
+            if t == "scnAnimName" && value.get("$rawTail").is_none() && value.get("unk1").is_some()
+            {
+                let names = array(value, "unk1")?;
+                if names.len() != 1
+                    || !array(value, "unk2")?.is_empty()
+                    || value.get("type").and_then(Value::as_str) != Some("direct")
+                {
+                    return Err(unsupported("scnAnimName non-direct appendix"));
+                }
+                out.extend(self.name_index(storage_value(&names[0])?)?.to_le_bytes());
+            }
+        }
+        Ok(out)
     }
 
     fn property_type(&self, property: &schema::RedProperty) -> Option<String> {
@@ -740,11 +1286,45 @@ impl Encoder<'_> {
     }
 
     fn schema_type(&self, cs_type: &str) -> Option<String> {
+        if let Some(inner) = cs_type
+            .strip_prefix("CArrayFixedSize<")
+            .and_then(|s| s.strip_suffix('>'))
+        {
+            return self.schema_type(inner).map(|t| format!("array:{t}"));
+        }
+
+        if let Some(inner) = cs_type
+            .strip_prefix("CBitField<")
+            .and_then(|s| s.strip_suffix('>'))
+        {
+            return Some(inner.into());
+        }
+
+        if matches!(
+            cs_type,
+            "DataBuffer"
+                | "SharedDataBuffer"
+                | "SerializationDeferredDataBuffer"
+                | "LocalizationString"
+                | "gamedataLocKeyWrapper"
+                | "CDateTime"
+        ) {
+            return Some(
+                if cs_type == "SerializationDeferredDataBuffer" {
+                    "serializationDeferredDataBuffer"
+                } else {
+                    cs_type
+                }
+                .into(),
+            );
+        }
         if let Some(red_type) = red_type_from_cs(cs_type) {
             return Some(red_type);
         }
         for (prefix, red_prefix) in [
             ("CArray<", "array:"),
+            ("CHandle<", "handle:"),
+            ("CWeakHandle<", "whandle:"),
             ("CResourceReference<", "rRef:"),
             ("CResourceAsyncReference<", "raRef:"),
         ] {
@@ -1867,6 +2447,7 @@ fn red_type_from_cs(cs_type: &str) -> Option<String> {
         "CFloat" => "Float",
         "CDouble" => "Double",
         "CName" => "CName",
+        "CColor" => "Color",
         "CString" => "String",
         "NodeRef" => "NodeRef",
         "TweakDBID" => "TweakDBID",
@@ -2567,6 +3148,8 @@ fn collect_redpackage_overrides(
                     PackageSettings {
                         imports_as_hash,
                         handle_id_base: 0,
+                        enums: None,
+                        bitfields: None,
                     },
                 ) else {
                     return Ok(());
@@ -2627,6 +3210,8 @@ fn resolve_redpackage_template_buffer(
             PackageSettings {
                 imports_as_hash,
                 handle_id_base: 0,
+                enums: None,
+                bitfields: None,
             },
         ) else {
             continue;
@@ -3265,6 +3850,95 @@ fn normalize_wolvenkit_enum_name(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_write_roundtrips_package_enum_arrays() {
+        let metadata = json!({
+            "entEntityTemplate":{"base":null,"properties":{"compiledData":{"cs_type":"DataBuffer","ordinal":0}}},
+            "PackageRoot":{"base":null,"properties":{"items":{"cs_type":"CArray<Operation>","ordinal":0}}},
+            "Operation":{"base":null,"properties":{
+                "label":{"cs_type":"CName","ordinal":0},
+                "flags":{"cs_type":"CBitField<Flags>","ordinal":1},
+                "mode":{"cs_type":"CEnum<Mode>","ordinal":2}}}});
+        let schema = super::RedSchema::from_slice(&serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.json");
+        let output = directory.path().join("output.ent");
+        let value = json!({"Data":{"RootChunk":{"$type":"entEntityTemplate","compiledData":{
+            "BufferId":"0","Flags":0,"Type":"RedPackage","Data":{"Version":4,"Sections":7,"CruidIndex":0,"CruidDict":{"0":"0"},"Chunks":[
+                {"$type":"PackageRoot","items":[
+                    {"$type":"Operation","label":{"$type":"CName","$value":"first"},"flags":"0","mode":"Enable"},
+                    {"$type":"Operation","label":{"$type":"CName","$value":"second"},"flags":"Visible","mode":"Disable"}]}]}}}}});
+        fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
+        super::write(&input, &output, &schema).unwrap();
+        let decoded = codec::decode_wkit_with_red_schema(&output, &schema, OsStr::new("")).unwrap();
+        assert_eq!(
+            decoded.pointer("/Data/RootChunk/compiledData/Data/Chunks/0/items/0/mode"),
+            Some(&json!("Enable"))
+        );
+        assert_eq!(
+            decoded.pointer("/Data/RootChunk/compiledData/Data/Chunks/0/items/1/mode"),
+            Some(&json!("Disable"))
+        );
+        assert_eq!(
+            decoded.pointer("/Data/RootChunk/compiledData/Data/Chunks/0/items/1/flags"),
+            Some(&json!("Visible"))
+        );
+    }
+
+    #[test]
+    fn writes_json_without_existing_cr2w() {
+        let schema=super::RedSchema::from_slice(br#"{"Example":{"base":null,"properties":{"enabled":{"cs_type":"CBool","ordinal":0},"children":{"cs_type":"CArray<CHandle<Example>>","ordinal":1}}}}"#).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.json");
+        let output = directory.path().join("output.cr2w");
+        let value = json!({"Data":{"RootChunk":{"$type":"Example","enabled":true,"children":[{"HandleId":"42","Data":{"$type":"Example","enabled":false,"children":[]}}]}}});
+        fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(!output.exists());
+        super::write(&input, &output, &schema).unwrap();
+        let inspection = cr2w::inspect(&output).unwrap();
+        assert_eq!(inspection.exports.len(), 2);
+        assert_eq!(inspection.header.chunk_count, 6);
+        assert_eq!(inspection.header.tables[3].item_count, 1);
+        let decoded = codec::decode_wkit_with_red_schema(&output, &schema, OsStr::new("")).unwrap();
+        assert_eq!(
+            decoded.pointer("/Data/RootChunk/enabled"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            decoded.pointer("/Data/RootChunk/children/0/Data/enabled"),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn direct_write_uses_empty_string_sentinel_and_offset_one() {
+        let names = vec!["None".to_owned(), "worldStreamingSector".to_owned()];
+        let (strings, table) = super::document_name_tables(&names).unwrap();
+        assert_eq!(strings, b"\0worldStreamingSector\0");
+        assert_eq!(u32::from_le_bytes(table[0..4].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(table[8..12].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn direct_write_rejects_missing_handle_without_creating_output() {
+        let schema=super::RedSchema::from_slice(br#"{"Example":{"base":null,"properties":{"child":{"cs_type":"CHandle<Example>","ordinal":0}}}}"#).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.json");
+        let output = directory.path().join("output.cr2w");
+        fs::write(
+            &input,
+            br#"{"Data":{"RootChunk":{"$type":"Example","child":{"HandleRefId":"42"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            super::write(&input, &output, &schema)
+                .unwrap_err()
+                .to_string()
+                .contains("unresolved handle 42")
+        );
+        assert!(!output.exists());
+    }
+
     use super::{
         Encoder, area_shape_outline_buffer, buffer_matches, channel_link_type_value,
         class_property, collect_handle_ids, compact_export_indices, encode_device_data_entry,
@@ -3340,6 +4014,10 @@ mod tests {
             schema: classes,
             enums: None,
             bitfields: None,
+            document_chunks: RefCell::new(vec![]),
+            created_buffers: RefCell::new(vec![]),
+            created_buffer_ids: RefCell::new(HashMap::new()),
+            package: false,
         };
         test(&encoder)
     }
@@ -4161,4 +4839,61 @@ mod tests {
             _ => false,
         }
     }
+}
+
+/// Creates a CR2W resource directly from JSON and reflection metadata.
+///
+/// # Errors
+/// Returns an error for invalid references, unsupported custom data or I/O.
+pub fn write(input: &Path, output: &Path, schema: &RedSchema) -> Result<(), WriterError> {
+    let document = read_json(input)?;
+    let file = empty_file();
+    let classes = schema.class_names();
+    let encoder = Encoder::new_document(&file, &classes, schema, false);
+    let root = document
+        .pointer("/Data/RootChunk")
+        .ok_or_else(|| unsupported("missing root"))?;
+    encoder.document_chunks.borrow_mut().push(root.clone());
+    encoder.discover_class_handles(root)?;
+    let bytes = encoder.encode_container(&document)?;
+    fs::write(output, bytes)?;
+    Ok(())
+}
+
+fn empty_file() -> Cr2wInspection {
+    Cr2wInspection {
+        header: cr2w::Cr2wHeader {
+            version: 195,
+            flags: 0,
+            timestamp: 0,
+            build_version: 0,
+            objects_end: 0,
+            buffers_end: 0,
+            crc32: 0,
+            chunk_count: 0,
+            tables: vec![],
+        },
+        strings: vec![],
+        names: vec![],
+        imports: vec![],
+        exports: vec![],
+        buffers: vec![],
+        embedded: vec![],
+    }
+}
+
+fn kind(value: &Value) -> Result<&str, WriterError> {
+    value
+        .get("$type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| unsupported("missing class type"))
+}
+fn array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], WriterError> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| unsupported(format!("missing array {key}")))
+}
+fn u32n(value: usize) -> Result<u32, WriterError> {
+    u32::try_from(value).map_err(|_| WriterError::TooLarge)
 }

@@ -63,10 +63,27 @@ impl RedSchema {
     pub fn from_slice(bytes: &[u8]) -> Result<Self, SchemaError> {
         let document: SchemaDocument = serde_json::from_slice(bytes)?;
         Ok(match document {
-            SchemaDocument::Legacy(classes) => Self {
-                classes,
-                ..Self::default()
-            },
+            SchemaDocument::Legacy(classes) => {
+                let mut result = Self {
+                    classes,
+                    ..Self::default()
+                };
+                for class in result.classes.values() {
+                    for property in class.properties.values() {
+                        for (prefix, types) in [
+                            ("CEnum<", &mut result.enums),
+                            ("CBitField<", &mut result.bitfields),
+                        ] {
+                            if let Some((_, suffix)) = property.cs_type.split_once(prefix) {
+                                if let Some((name, _)) = suffix.split_once('>') {
+                                    types.insert(name.into());
+                                }
+                            }
+                        }
+                    }
+                }
+                result
+            }
             SchemaDocument::Redmod(metadata) => metadata.into(),
         })
     }

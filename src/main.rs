@@ -166,11 +166,11 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         threads: usize,
     },
-    /// Deserialize WKit-shaped JSON using an existing CR2W table/layout template.
+    /// Deserialize WKit-shaped JSON directly, or rebuild an explicitly supplied CR2W.
     Cr2wDeserialize {
         input: PathBuf,
         #[arg(long)]
-        template: PathBuf,
+        template: Option<PathBuf>,
         /// Schema sources in increasing precedence order.
         #[arg(long, required = true)]
         schema: Vec<PathBuf>,
@@ -497,13 +497,17 @@ fn main() -> Result<()> {
             output,
         } => {
             let schema = load_schemas(&schema)?;
-            writer::write_with_red_schema(
-                &input,
-                &template,
-                &output,
-                &schema,
-                cli.kraken.as_os_str(),
-            )?;
+            if let Some(template) = template {
+                writer::write_with_red_schema(
+                    &input,
+                    &template,
+                    &output,
+                    &schema,
+                    cli.kraken.as_os_str(),
+                )?;
+            } else {
+                writer::write(&input, &output, &schema)?;
+            }
         }
         Command::Cr2wSerializeLocalization { input, output } => {
             localization::write_json(&input, &output)?;

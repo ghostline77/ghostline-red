@@ -18,9 +18,11 @@ pub enum PackageError {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct PackageSettings {
+pub struct PackageSettings<'a> {
     pub imports_as_hash: bool,
     pub handle_id_base: usize,
+    pub enums: Option<&'a BTreeSet<String>>,
+    pub bitfields: Option<&'a BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +45,8 @@ struct Reader<'a> {
     classes: &'a BTreeSet<String>,
     version: u8,
     unknown1: u8,
+    enums: Option<&'a BTreeSet<String>>,
+    bitfields: Option<&'a BTreeSet<String>>,
 }
 
 #[derive(Debug)]
@@ -139,6 +143,8 @@ pub fn decode(
         classes,
         version,
         unknown1,
+        enums: settings.enums,
+        bitfields: settings.bitfields,
     };
     let mut chunks = Vec::with_capacity(chunk_headers.len());
     for (index, (type_index, offset)) in chunk_headers.iter().copied().enumerate() {
@@ -268,6 +274,8 @@ pub fn encode_with_template(
             classes,
             version: layout.layout.version,
             unknown1: layout.layout.unknown1,
+            enums: settings.enums,
+            bitfields: settings.bitfields,
         },
         names: RefCell::new(names),
         new_names: RefCell::new(Vec::new()),
@@ -389,7 +397,7 @@ struct ParsedLayout<'a> {
 fn parse_layout<'a>(
     bytes: &'a [u8],
     classes: &'a BTreeSet<String>,
-    settings: PackageSettings,
+    settings: PackageSettings<'a>,
 ) -> Result<ParsedLayout<'a>, PackageError> {
     let version = byte(bytes, 0)?;
     let unknown1 = byte(bytes, 1)?;
@@ -430,6 +438,8 @@ fn parse_layout<'a>(
             classes,
             version,
             unknown1,
+            enums: settings.enums,
+            bitfields: settings.bitfields,
         },
         layout: PackageLayout {
             version,
@@ -581,6 +591,11 @@ impl Reader<'_> {
             let name = self.name(name_index, field_start)?;
             let red_type = self.name(type_index, field_start)?;
             let value_limit = fixed_size(red_type)
+                .or_else(|| {
+                    self.enums
+                        .is_some_and(|types| types.contains(red_type))
+                        .then_some(2)
+                })
                 .and_then(|size| field_start.checked_add(size))
                 .unwrap_or(field_limit);
             let decoded = if class_name == "worldCompiledEffectInfo" && self.unknown1 == 2 {
@@ -699,6 +714,34 @@ impl Reader<'_> {
         start: usize,
         limit: usize,
     ) -> Result<(Value, usize), PackageError> {
+        if self.enums.is_some_and(|types| types.contains(red_type)) {
+            return Ok((
+                Value::String(
+                    self.name(usize::from(u16_at(self.bytes, start)?), start)?
+                        .into(),
+                ),
+                start + 2,
+            ));
+        }
+        if self.bitfields.is_some_and(|types| types.contains(red_type)) {
+            let count = usize::from(byte(self.bytes, start)?);
+            let end = start + 1 + count * 2;
+            if end > limit {
+                return Err(malformed(start, "bitfield bounds"));
+            }
+            let mut names = vec![];
+            for i in 0..count {
+                names.push(self.name(usize::from(u16_at(self.bytes, start + 1 + i * 2)?), start)?);
+            }
+            return Ok((
+                Value::String(if names.is_empty() {
+                    "0".into()
+                } else {
+                    names.join(", ")
+                }),
+                end,
+            ));
+        }
         let exact = |value| Ok((value, limit));
         match red_type {
             "Bool" | "Uint8" => exact(json!(byte(self.bytes, start)?)),

@@ -536,6 +536,22 @@ impl Decoder<'_> {
         end: usize,
         object: &mut Map<String, Value>,
     ) -> usize {
+        if red_type == "scnAnimName"
+            && end == cursor + 2
+            && object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("direct")
+                == "direct"
+        {
+            if let Ok(index) = self.u16(cursor) {
+                if let Ok(name) = self.name(usize::from(index), cursor) {
+                    object.insert("unk1".into(), json!([storage_string("CName", name)]));
+                    object.insert("unk2".into(), json!([]));
+                    return end;
+                }
+            }
+        }
         if cursor >= end || !is_opaque_appendix(red_type) {
             return cursor;
         }
@@ -1224,6 +1240,8 @@ impl Decoder<'_> {
             PackageSettings {
                 imports_as_hash,
                 handle_id_base,
+                enums: self.enums,
+                bitfields: self.bitfields,
             },
         ) else {
             return Ok(json!({
