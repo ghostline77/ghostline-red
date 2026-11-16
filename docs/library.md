@@ -6,7 +6,7 @@ For a project beside this checkout, add this dependency to its `Cargo.toml`:
 
 ```toml
 [dependencies]
-ghostline-red = { path = "../ghostline-red" }
+ghostline-red = { git = "https://github.com/ghostline77/ghostline-red" }
 ```
 
 Generate the Rust API reference from the ghostline-red repository root:

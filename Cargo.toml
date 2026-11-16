@@ -2,9 +2,10 @@
 name = "ghostline-red"
 version = "0.1.0"
 edition = "2024"
+links = "ghostline_red"
 license = "MIT"
 description = "Fast native Cyberpunk 2077 archive and CR2W tooling"
-repository = "https://github.com/hlky/ghostline-red"
+repository = "https://github.com/ghostline77/ghostline-red"
 readme = "README.md"
 keywords = ["cyberpunk-2077", "cr2w", "modding", "archive"]
 categories = ["command-line-utilities", "encoding"]
