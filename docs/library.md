@@ -2,7 +2,7 @@
 
 ## Dependency and API documentation
 
-For a project beside this checkout, add this dependency to its `Cargo.toml`:
+Add this dependency to its `Cargo.toml`:
 
 ```toml
 [dependencies]
