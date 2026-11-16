@@ -1,4 +1,4 @@
-//! Implements a DLL-free interoperable Oodle Kraken byte stream.
+//! Implements an interoperable Kraken byte stream in Rust.
 //!
 //! Streams are divided into 256 KiB blocks with continuing history. This module emits
 //! compatible raw, constant-byte, general Huffman, compact tANS, and
@@ -1552,10 +1552,36 @@ fn decode_huffman_group(
 
 struct OldHuffmanTable {
     entries: Vec<(u16, u8, u8)>,
+    lookup: Vec<(u8, u8)>,
 }
 
 impl OldHuffmanTable {
     fn decode(&self, bits: &mut HuffBits<'_>, offset: usize) -> Result<u8, KrakenError> {
+        // Codes are at most eleven bits. Decode the whole prefix in one lookup
+        // rather than scanning every symbol after each individual input bit.
+        let available = bits.bytes.len().saturating_mul(8).saturating_sub(bits.bit);
+        if available > 0 {
+            let byte = bits.bit / 8;
+            let read = |index: usize| -> u32 {
+                let index = if bits.reverse_bytes {
+                    bits.bytes.len().checked_sub(index + 1)
+                } else {
+                    Some(index)
+                };
+                index
+                    .and_then(|i| bits.bytes.get(i))
+                    .copied()
+                    .map_or(0, u32::from)
+            };
+            let prefix =
+                (read(byte) | read(byte + 1) << 8 | read(byte + 2) << 16) >> (bits.bit & 7);
+            let (symbol, length) = self.lookup[(prefix & 2047) as usize];
+            if usize::from(length) <= available {
+                bits.bit += usize::from(length);
+                return Ok(symbol);
+            }
+        }
+        // Preserve precise truncated-stream errors at the final partial code.
         let mut code = 0_u16;
         for length in 1..=11_u8 {
             code |= u16::from(bits.read(offset)?) << (length - 1);
@@ -2254,7 +2280,13 @@ fn canonical_huffman_table(symbols: &[u8], lengths: &[u8]) -> Option<OldHuffmanT
         code = code.checked_add(1)?;
         previous_length = length;
     }
-    Some(OldHuffmanTable { entries })
+    let mut lookup = vec![(0, 0); 2048];
+    for &(code, length, symbol) in &entries {
+        for suffix in 0..(1_usize << (11 - length)) {
+            lookup[usize::from(code) | (suffix << length)] = (symbol, length);
+        }
+    }
+    Some(OldHuffmanTable { entries, lookup })
 }
 
 fn reverse_low_bits(mut value: u16, bit_count: u8) -> u16 {
@@ -2755,14 +2787,41 @@ fn emit_literals(
             offset: stream_offset,
         });
     }
-    for &literal in source {
-        let value = if mode == 0 {
-            let predictor = history_index(output.len(), last_offset, output_start, stream_offset)?;
-            literal.wrapping_add(output[predictor])
+    if mode != 0 {
+        output.extend_from_slice(source);
+    } else if !source.is_empty() {
+        let start = output.len();
+        let predictor = history_index(start, last_offset, output_start, stream_offset)?;
+        let distance = start - predictor;
+        if distance < 16 || count < 16 {
+            // Short-distance predictors depend on bytes just emitted. Validate
+            // the history once while preserving that sequential dependency.
+            for (index, &literal) in source.iter().enumerate() {
+                output.push(literal.wrapping_add(output[predictor + index]));
+            }
         } else {
-            literal
-        };
-        output.push(value);
+            let end = start
+                .checked_add(count)
+                .ok_or(KrakenError::InvalidQuantum {
+                    offset: stream_offset,
+                })?;
+            output.resize(end, 0);
+            let mut written = 0;
+            while written < count {
+                let amount = (count - written).min(distance);
+                let (history, destination) = output.split_at_mut(start + written);
+                // Non-aliasing byte slices let LLVM vectorize wrapping addition.
+                // Each batch ends before its predictor reaches new output.
+                for ((dest, literal), previous) in destination[..amount]
+                    .iter_mut()
+                    .zip(&source[written..written + amount])
+                    .zip(&history[predictor + written..predictor + written + amount])
+                {
+                    *dest = literal.wrapping_add(*previous);
+                }
+                written += amount;
+            }
+        }
     }
     *literal_cursor = literal_end;
     Ok(())
@@ -3133,6 +3192,46 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn literal_batches_preserve_predictor_overlap_and_wrapping() {
+        for distance in [1, 4, 8, 15, 16, 17, 64] {
+            for count in [0, 1, 15, 16, 17, 63, 257] {
+                for mode in [0, 1] {
+                    let prefix: Vec<u8> = (0..64_u8).map(|value| value.wrapping_mul(7)).collect();
+                    let literals: Vec<u8> = (0..count)
+                        .map(|index| u8::try_from(index % 256).unwrap().wrapping_mul(11))
+                        .collect();
+                    let mut expected = prefix.clone();
+                    for &literal in &literals {
+                        expected.push(if mode == 0 {
+                            literal.wrapping_add(expected[expected.len() - distance])
+                        } else {
+                            literal
+                        });
+                    }
+                    let mut actual = prefix;
+                    let mut cursor = 0;
+                    super::emit_literals(
+                        &mut actual,
+                        64 + count,
+                        &literals,
+                        &mut cursor,
+                        count,
+                        -i32::try_from(distance).unwrap(),
+                        mode,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "distance={distance}, count={count}, mode={mode}"
+                    );
+                    assert_eq!(cursor, count);
+                }
+            }
+        }
+    }
     use super::{
         BLOCK_SIZE, CHUNK_SIZE, COMPRESSED_BLOCK_HEADER, Cursor, KrakenError, LsbWriter,
         MAINMENU_RLE_COMMAND_HEADER, PairedBits, STREAMINGWORLD_LITERAL_HEADER,

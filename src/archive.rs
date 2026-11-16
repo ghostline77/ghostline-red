@@ -1,20 +1,14 @@
 //! Reader for the index of a Cyberpunk 2077 `.archive` file.
 
-use crate::{
-    binary::ReadLeExt,
-    compression::{CompressionError, Kraken},
-    cr2w, kraken,
-};
+use crate::{binary::ReadLeExt, cr2w, kraken};
 use rayon::prelude::*;
 use serde::Serialize;
 use sha1::{Digest, Sha1};
 use std::{
     collections::HashMap,
-    ffi::OsStr,
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
 };
 use thiserror::Error;
 
@@ -42,8 +36,6 @@ pub enum ArchiveError {
     InvalidSegmentRange { entry: usize, start: u32, end: u32 },
     #[error("archive table counts overflow addressable memory")]
     CountOverflow,
-    #[error("archive compression failed: {0}")]
-    Compression(#[from] CompressionError),
     #[error("archive entry {hash:016x} has no resolvable depot path")]
     UnresolvedPath { hash: u64 },
     #[error("archive contains no entry for depot-path hash {hash:016x}")]
@@ -54,12 +46,6 @@ pub enum ArchiveError {
     DuplicateHash { hash: u64 },
     #[error("unsupported or malformed CR2W payload: {0}")]
     Cr2w(#[from] cr2w::Cr2wError),
-    #[error("compressed archive segment requires a Kraken library")]
-    KrakenRequired,
-    #[error("crash-isolated Kraken decompression worker failed")]
-    DecompressionWorker,
-    #[error("clean Kraken decoder failed ({clean}); native worker also failed")]
-    KrakenFallbackFailed { clean: kraken::KrakenError },
     #[error("native Rust Kraken decoder failed: {0}")]
     KrakenDecode(#[from] kraken::KrakenError),
 }
@@ -279,7 +265,7 @@ pub fn read_archive(path: &Path) -> Result<ArchiveIndex, ArchiveError> {
 ///
 /// Returns [`ArchiveError`] for invalid paths, duplicate hashes, malformed
 /// CR2W files, compression failures, or output I/O failures.
-pub fn pack(source: &Path, output: &Path, kraken_path: &OsStr) -> Result<(), ArchiveError> {
+pub fn pack(source: &Path, output: &Path) -> Result<(), ArchiveError> {
     let mut files = collect_files(source)?;
     files.sort_by_key(|(hash, _, _)| *hash);
     for pair in files.windows(2) {
@@ -300,7 +286,7 @@ pub fn pack(source: &Path, output: &Path, kraken_path: &OsStr) -> Result<(), Arc
                     payloads.push(payload.to_vec());
                 }
             }
-            let compressed = compress_batch_isolated(&payloads, kraken_path);
+            let compressed = compress_batch(&payloads);
             let mut result: Vec<Option<Vec<u8>>> = (0..chunk.len()).map(|_| None).collect();
             for (position, payload) in positions.into_iter().zip(compressed) {
                 result[position] = payload;
@@ -369,12 +355,11 @@ pub fn pack(source: &Path, output: &Path, kraken_path: &OsStr) -> Result<(), Arc
 pub fn extract(
     archive_path: &Path,
     output: &Path,
-    kraken_path: &OsStr,
     paths_root: Option<&Path>,
 ) -> Result<(), ArchiveError> {
     let index = read_archive(archive_path)?;
     let mut custom_paths = if index.custom_paths.is_empty() {
-        read_compressed_custom_paths(archive_path, kraken_path)?
+        read_compressed_custom_paths(archive_path)?
     } else {
         index.custom_paths.clone()
     };
@@ -414,12 +399,7 @@ pub fn extract(
                 end: entry.segments_end,
             })?;
         for (segment_index, segment) in selected.iter().enumerate() {
-            target_file.write_all(&read_segment(
-                &mut archive,
-                *segment,
-                kraken_path,
-                segment_index == 0,
-            )?)?;
+            target_file.write_all(&read_segment(&mut archive, *segment, segment_index == 0)?)?;
         }
         target_file.flush()?;
     }
@@ -440,7 +420,6 @@ pub fn extract_path(
     archive_path: &Path,
     output: &Path,
     depot_path: &str,
-    kraken_path: &OsStr,
 ) -> Result<(), ArchiveError> {
     let index = read_archive(archive_path)?;
     let name_hash = depot_path_hash(depot_path);
@@ -467,12 +446,7 @@ pub fn extract_path(
             end: entry.segments_end,
         })?;
     for (segment_index, segment) in selected.iter().enumerate() {
-        target_file.write_all(&read_segment(
-            &mut archive,
-            *segment,
-            kraken_path,
-            segment_index == 0,
-        )?)?;
+        target_file.write_all(&read_segment(&mut archive, *segment, segment_index == 0)?)?;
     }
     target_file.flush()?;
     Ok(())
@@ -491,7 +465,6 @@ pub fn extract_entry_bytes(
     archive_path: &Path,
     index: &ArchiveIndex,
     entry_index: usize,
-    kraken_path: &OsStr,
 ) -> Result<Vec<u8>, ArchiveError> {
     let entry = index
         .entries
@@ -516,14 +489,26 @@ pub fn extract_entry_bytes(
     let mut archive = BufReader::new(File::open(archive_path)?);
     let mut result = Vec::with_capacity(capacity);
     for (segment_index, segment) in selected.iter().enumerate() {
-        result.extend(read_segment(
-            &mut archive,
-            *segment,
-            kraken_path,
-            segment_index == 0,
-        )?);
+        result.extend(read_segment(&mut archive, *segment, segment_index == 0)?);
     }
     Ok(result)
+}
+
+/// Reads the main resource segment without loading deferred bulk buffers.
+///
+/// # Errors
+/// Returns an error for an invalid entry/segment, I/O or decompression failure.
+pub fn extract_entry_main_bytes(
+    archive_path: &Path,
+    index: &ArchiveIndex,
+    entry_index: usize,
+) -> Result<Vec<u8>, ArchiveError> {
+    let entry = index.entries.get(entry_index).ok_or(ArchiveError::InvalidIndex)?;
+    let segment = index.segments.get(entry.segments_start as usize)
+        .filter(|_| entry.segments_start < entry.segments_end)
+        .ok_or(ArchiveError::InvalidIndex)?;
+    let mut reader = BufReader::new(File::open(archive_path)?);
+    read_segment(&mut reader, *segment, true)
 }
 
 fn collect_files(source: &Path) -> Result<Vec<(u64, String, PathBuf)>, ArchiveError> {
@@ -536,7 +521,7 @@ fn collect_files(source: &Path) -> Result<Vec<(u64, String, PathBuf)>, ArchiveEr
                 pending.push(path);
                 continue;
             }
-            let Some(extension) = path.extension().and_then(OsStr::to_str) else {
+            let Some(extension) = path.extension().and_then(std::ffi::OsStr::to_str) else {
                 continue;
             };
             if matches!(
@@ -643,148 +628,17 @@ fn should_store_uncompressed(depot_path: &str) -> bool {
         || lower.ends_with("soundbanks.json")
 }
 
-/// Compresses a framed batch inside the current process.
-///
-/// This exists only for the hidden crash-isolated native-library diagnostic
-/// worker. Normal packing uses the Rust encoder directly.
-///
-/// # Errors
-///
-/// Returns [`ArchiveError`] when the frame is invalid or Kraken cannot load,
-/// compress, or validate every payload.
-pub fn compress_worker_batch(
-    wire_input: &[u8],
-    kraken_path: &OsStr,
-) -> Result<Vec<u8>, ArchiveError> {
-    let mut cursor = 0_usize;
-    let count = usize::try_from(read_wire_u32(wire_input, &mut cursor)?)
-        .map_err(|_| ArchiveError::CountOverflow)?;
-    if count > COMPRESSION_BATCH_SIZE {
-        return Err(ArchiveError::InvalidIndex);
-    }
-    let mut inputs = Vec::with_capacity(count);
-    for _ in 0..count {
-        let length = usize::try_from(read_wire_u64(wire_input, &mut cursor)?)
-            .map_err(|_| ArchiveError::CountOverflow)?;
-        let end = cursor
-            .checked_add(length)
-            .ok_or(ArchiveError::CountOverflow)?;
-        inputs.push(
-            wire_input
-                .get(cursor..end)
-                .ok_or(ArchiveError::InvalidIndex)?,
-        );
-        cursor = end;
-    }
-    if cursor != wire_input.len() {
-        return Err(ArchiveError::InvalidIndex);
-    }
-    let kraken = Kraken::load(kraken_path)?;
-    let mut output = Vec::new();
-    write_u32(
-        &mut output,
-        u32::try_from(count).map_err(|_| ArchiveError::CountOverflow)?,
-    )?;
-    for input in inputs {
-        let compressed = kraken.compress_validated(input)?;
-        write_u64(
-            &mut output,
-            u64::try_from(compressed.len()).map_err(|_| ArchiveError::CountOverflow)?,
-        )?;
-        output.extend_from_slice(&compressed);
-    }
-    Ok(output)
-}
-
-/// Decompresses one framed payload inside the current process.
-///
-/// This is only called by the hidden worker command so a faulty native codec
-/// cannot corrupt the long-lived CLI process.
-///
-/// # Errors
-///
-/// Returns [`ArchiveError`] for malformed framing, codec loading failures, or
-/// invalid decompression output.
-pub fn decompress_worker(wire_input: &[u8], kraken_path: &OsStr) -> Result<Vec<u8>, ArchiveError> {
-    let mut cursor = 0_usize;
-    let expected_size = usize::try_from(read_wire_u64(wire_input, &mut cursor)?)
-        .map_err(|_| ArchiveError::CountOverflow)?;
-    let compressed_size = usize::try_from(read_wire_u64(wire_input, &mut cursor)?)
-        .map_err(|_| ArchiveError::CountOverflow)?;
-    let end = cursor
-        .checked_add(compressed_size)
-        .ok_or(ArchiveError::CountOverflow)?;
-    let compressed = wire_input
-        .get(cursor..end)
-        .filter(|_| end == wire_input.len())
-        .ok_or(ArchiveError::InvalidIndex)?;
-    Kraken::load(kraken_path)?
-        .decompress(compressed, expected_size)
-        .map_err(ArchiveError::from)
-}
-
 /// Decompresses a raw Kraken stream with the native Rust implementation.
 ///
 /// # Errors
 ///
 /// Returns [`ArchiveError`] if the stream is unsupported, malformed, or does
 /// not produce exactly `expected_size` bytes.
-pub fn decompress_payload_isolated(
-    input: &[u8],
-    expected_size: usize,
-    _kraken_path: &OsStr,
-) -> Result<Vec<u8>, ArchiveError> {
+pub fn decompress_payload(input: &[u8], expected_size: usize) -> Result<Vec<u8>, ArchiveError> {
     Ok(kraken::decode(input, expected_size)?)
 }
 
-/// Tries the native Rust decoder before an explicitly requested native-library
-/// fallback in a crash-isolated worker.
-///
-/// # Errors
-///
-/// Returns [`ArchiveError`] if neither implementation decodes exactly
-/// `expected_size` bytes.
-pub fn decompress_payload_native_fallback(
-    input: &[u8],
-    expected_size: usize,
-    kraken_path: &OsStr,
-) -> Result<Vec<u8>, ArchiveError> {
-    let clean_error = match kraken::decode(input, expected_size) {
-        Ok(output) => return Ok(output),
-        Err(error) => error,
-    };
-    let executable = std::env::current_exe()?;
-    let mut child = Command::new(executable)
-        .arg("--kraken")
-        .arg(kraken_path)
-        .arg("kraken-decompress-worker")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut wire = Vec::with_capacity(input.len().saturating_add(16));
-    write_u64(
-        &mut wire,
-        u64::try_from(expected_size).map_err(|_| ArchiveError::CountOverflow)?,
-    )?;
-    write_u64(
-        &mut wire,
-        u64::try_from(input.len()).map_err(|_| ArchiveError::CountOverflow)?,
-    )?;
-    wire.extend_from_slice(input);
-    child
-        .stdin
-        .take()
-        .ok_or(ArchiveError::DecompressionWorker)?
-        .write_all(&wire)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() || output.stdout.len() != expected_size {
-        return Err(ArchiveError::KrakenFallbackFailed { clean: clean_error });
-    }
-    Ok(output.stdout)
-}
-
-fn compress_batch_isolated(inputs: &[Vec<u8>], _kraken_path: &OsStr) -> Vec<Option<Vec<u8>>> {
+fn compress_batch(inputs: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
     inputs
         .iter()
         .map(|input| {
@@ -794,118 +648,21 @@ fn compress_batch_isolated(inputs: &[Vec<u8>], _kraken_path: &OsStr) -> Vec<Opti
         .collect()
 }
 
-fn compress_batch_native_worker(inputs: &[Vec<u8>], kraken_path: &OsStr) -> Vec<Option<Vec<u8>>> {
-    if inputs.is_empty() {
-        return Vec::new();
-    }
-    let fallback = || {
-        inputs
-            .iter()
-            .map(|input| {
-                let encoded = kraken::encode(input);
-                (encoded.len() < input.len()).then_some(encoded)
-            })
-            .collect()
-    };
-    let Ok(executable) = std::env::current_exe() else {
-        return fallback();
-    };
-    let child = Command::new(executable)
-        .arg("--kraken")
-        .arg(kraken_path)
-        .arg("kraken-compress-worker")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    let Ok(mut child) = child else {
-        return fallback();
-    };
-    let mut wire = Vec::new();
-    if write_u32(&mut wire, u32::try_from(inputs.len()).unwrap_or(u32::MAX)).is_err() {
-        return fallback();
-    }
-    for input in inputs {
-        if write_u64(&mut wire, u64::try_from(input.len()).unwrap_or(u64::MAX)).is_err() {
-            return fallback();
-        }
-        wire.extend_from_slice(input);
-    }
-    let Some(mut stdin) = child.stdin.take() else {
-        return fallback();
-    };
-    if stdin.write_all(&wire).is_err() {
-        return fallback();
-    }
-    drop(stdin);
-    let Ok(output) = child.wait_with_output() else {
-        return fallback();
-    };
-    if !output.status.success() {
-        return fallback();
-    }
-    parse_compression_batch(&output.stdout, inputs.len()).unwrap_or_else(fallback)
-}
-
 /// Compresses one payload with the native Rust Kraken encoder.
 ///
 /// This function is infallible by design.
 #[must_use]
-pub fn compress_payload_isolated(input: &[u8], kraken_path: &OsStr) -> Vec<u8> {
-    compress_batch_isolated(&[input.to_vec()], kraken_path)
+pub fn compress_payload(input: &[u8]) -> Vec<u8> {
+    compress_batch(&[input.to_vec()])
         .into_iter()
         .next()
         .flatten()
         .unwrap_or_else(|| kraken::encode(input))
-}
-
-/// Compresses one payload through an explicitly requested crash-isolated
-/// native-library worker, falling back to the native Rust encoder.
-#[must_use]
-pub fn compress_payload_native_worker(input: &[u8], kraken_path: &OsStr) -> Vec<u8> {
-    compress_batch_native_worker(&[input.to_vec()], kraken_path)
-        .into_iter()
-        .next()
-        .flatten()
-        .unwrap_or_else(|| kraken::encode(input))
-}
-
-fn parse_compression_batch(bytes: &[u8], expected: usize) -> Option<Vec<Option<Vec<u8>>>> {
-    let mut cursor = 0_usize;
-    let count = usize::try_from(read_wire_u32(bytes, &mut cursor).ok()?).ok()?;
-    if count != expected {
-        return None;
-    }
-    let mut result = Vec::with_capacity(count);
-    for _ in 0..count {
-        let length = usize::try_from(read_wire_u64(bytes, &mut cursor).ok()?).ok()?;
-        let end = cursor.checked_add(length)?;
-        result.push(Some(bytes.get(cursor..end)?.to_vec()));
-        cursor = end;
-    }
-    (cursor == bytes.len()).then_some(result)
-}
-
-fn read_wire_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, ArchiveError> {
-    let value = read_u32_at(bytes, *cursor)?;
-    *cursor += 4;
-    Ok(value)
-}
-
-fn read_wire_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, ArchiveError> {
-    let data: [u8; 8] = bytes
-        .get(*cursor..*cursor + 8)
-        .ok_or(ArchiveError::InvalidIndex)?
-        .try_into()
-        .map_err(|_| ArchiveError::InvalidIndex)?;
-    *cursor += 8;
-    Ok(u64::from_le_bytes(data))
 }
 
 fn read_segment(
     reader: &mut (impl Read + Seek),
     segment: ArchiveSegment,
-    kraken_path: &OsStr,
     decompress: bool,
 ) -> Result<Vec<u8>, ArchiveError> {
     reader.seek(SeekFrom::Start(segment.offset))?;
@@ -922,10 +679,9 @@ fn read_segment(
         return Ok(payload);
     }
     let declared = read_u32_at(&payload, 4)?;
-    decompress_payload_isolated(
+    decompress_payload(
         &payload[8..],
         usize::try_from(declared).map_err(|_| ArchiveError::CountOverflow)?,
-        kraken_path,
     )
 }
 
@@ -996,10 +752,7 @@ fn read_custom_paths(path: &Path, length: u32) -> Result<Vec<String>, ArchiveErr
     Ok(result)
 }
 
-fn read_compressed_custom_paths(
-    path: &Path,
-    kraken_path: &OsStr,
-) -> Result<Vec<String>, ArchiveError> {
+fn read_compressed_custom_paths(path: &Path) -> Result<Vec<String>, ArchiveError> {
     let mut reader = BufReader::new(File::open(path)?);
     reader.seek(SeekFrom::Start(
         u64::try_from(EXTENDED_HEADER_SIZE).map_err(|_| ArchiveError::CountOverflow)?,
@@ -1019,10 +772,9 @@ fn read_compressed_custom_paths(
     let mut compressed =
         vec![0_u8; usize::try_from(compressed_size).map_err(|_| ArchiveError::CountOverflow)?];
     reader.read_exact(&mut compressed)?;
-    let bytes = decompress_payload_isolated(
+    let bytes = decompress_payload(
         &compressed,
         usize::try_from(size).map_err(|_| ArchiveError::CountOverflow)?,
-        kraken_path,
     )?;
     decode_custom_paths(&bytes, count)
 }
@@ -1031,12 +783,11 @@ fn read_compressed_custom_paths(
 ///
 /// # Errors
 ///
-/// Returns [`ArchiveError`] for malformed metadata, I/O failures, or native
-/// decompression worker failure.
-pub fn read_archive_paths(path: &Path, kraken_path: &OsStr) -> Result<Vec<String>, ArchiveError> {
+/// Returns [`ArchiveError`] for malformed metadata, I/O failures, or Rust decompression failure.
+pub fn read_archive_paths(path: &Path) -> Result<Vec<String>, ArchiveError> {
     let index = read_archive(path)?;
     if index.custom_paths.is_empty() {
-        read_compressed_custom_paths(path, kraken_path)
+        read_compressed_custom_paths(path)
     } else {
         Ok(index.custom_paths)
     }
@@ -1227,7 +978,6 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
     use std::io::{Cursor, Write};
 
     #[test]
@@ -1256,14 +1006,13 @@ mod tests {
         let mut path = tempfile::NamedTempFile::new().unwrap();
         path.write_all(&[0_u8; EXTENDED_HEADER_SIZE + 8]).unwrap();
 
-        let paths =
-            read_compressed_custom_paths(path.path(), OsStr::new("missing-kraken.dll")).unwrap();
+        let paths = read_compressed_custom_paths(path.path()).unwrap();
 
         assert!(paths.is_empty());
     }
 
     #[test]
-    fn clean_decoder_reads_compressed_lxrs_metadata_without_a_dll() {
+    fn rust_decoder_reads_compressed_lxrs_metadata() {
         let paths: Vec<String> = (0..128)
             .map(|index| format!("mod/ghostline/shared/asset_{index:03}.ent"))
             .collect();
@@ -1285,10 +1034,7 @@ mod tests {
         file.write_all(&compressed).unwrap();
         file.flush().unwrap();
 
-        assert_eq!(
-            read_compressed_custom_paths(file.path(), OsStr::new("missing-kraken.dll")).unwrap(),
-            paths
-        );
+        assert_eq!(read_compressed_custom_paths(file.path()).unwrap(), paths);
     }
 
     #[test]
@@ -1312,13 +1058,13 @@ mod tests {
         fs::write(depot.join("payload.ent"), &payload).unwrap();
         let archive = workspace.path().join("payload.archive");
 
-        pack(&source, &archive, OsStr::new("missing-kraken.dll")).unwrap();
+        pack(&source, &archive).unwrap();
         let index = read_archive(&archive).unwrap();
         assert_eq!(index.entries.len(), 1);
         assert!(index.entries[0].compressed_size < index.entries[0].size);
 
         let extracted = workspace.path().join("extracted");
-        extract(&archive, &extracted, OsStr::new("missing-kraken.dll"), None).unwrap();
+        extract(&archive, &extracted, None).unwrap();
         assert_eq!(
             fs::read(extracted.join("mod").join("test").join("payload.ent")).unwrap(),
             payload
@@ -1331,8 +1077,6 @@ mod tests {
         let path = PathBuf::from(std::env::var_os("ARCHIVE_FIXTURE").unwrap());
         let index = read_archive(&path).unwrap();
         let mut archive = fs::File::open(path).unwrap();
-        let native = std::env::var_os("KRAKEN_DLL")
-            .map(|path| crate::compression::Kraken::load(OsStr::new(&path)).unwrap());
         let segment_start = std::env::var("ARCHIVE_SEGMENT_START")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -1359,17 +1103,6 @@ mod tests {
             let declared = read_u32_at(&encoded, 4).unwrap();
             match kraken::decode(&encoded[8..], usize::try_from(declared).unwrap()) {
                 Ok(bytes) if bytes.len() == usize::try_from(segment.size).unwrap() => {
-                    if let Some(native) = &native {
-                        let expected = native
-                            .decompress(&encoded[8..], usize::try_from(segment.size).unwrap())
-                            .unwrap();
-                        if bytes != expected {
-                            failures.push(format!(
-                                "segment {segment_index}: clean/native bytes differ"
-                            ));
-                            continue;
-                        }
-                    }
                     decoded += 1;
                 }
                 Ok(bytes) if failures.len() < 100 => failures.push(format!(

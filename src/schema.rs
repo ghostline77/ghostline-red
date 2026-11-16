@@ -1,21 +1,26 @@
-//! Generates a compact RED reflection schema from the pinned `WolvenKit` source.
+//! RED reflection with bundled serialization definitions and game metadata overlays.
 
-use regex::Regex;
+mod bundle;
+mod scripts;
+pub use bundle::{Provenance, Source};
+
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
-    path::{Path, PathBuf},
+    path::Path,
+    sync::OnceLock,
 };
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SchemaError {
-    #[error("could not access WolvenKit source: {0}")]
+    #[error("could not access schema source: {0}")]
     Io(#[from] io::Error),
-    #[error("invalid schema parser expression: {0}")]
-    Regex(#[from] regex::Error),
-    #[error("could not encode schema: {0}")]
+    #[error("invalid RED reflection schema: {0}")]
+    Invalid(String),
+    #[error("could not read or encode schema JSON: {0}")]
     Json(#[from] serde_json::Error),
 }
 
@@ -44,7 +49,8 @@ pub struct RedProperty {
 }
 
 /// Holds RED reflection types from legacy schemas or official `REDmod` metadata.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RedSchema {
     pub classes: BTreeMap<String, RedClass>,
     pub enums: BTreeSet<String>,
@@ -54,6 +60,100 @@ pub struct RedSchema {
 }
 
 impl RedSchema {
+    /// Loads the bundled baseline, installed game metadata and an optional override.
+    ///
+    /// Installed native metadata takes precedence over the baseline. An explicit
+    /// override is applied last. No game installation is needed for offline files.
+    ///
+    /// # Errors
+    /// Returns an error for malformed installed metadata or an unreadable override.
+    pub fn load(
+        game_root: Option<&Path>,
+        override_path: Option<&Path>,
+    ) -> Result<Self, SchemaError> {
+        let mut schema = Self::bundled()?;
+        if let Some(game) = game_root {
+            let scripts = game.join("r6/cache/final.redscripts");
+            if scripts.is_file() {
+                let mut installed = self::scripts::read(&fs::read(scripts)?)?;
+                // Script identifiers are not always serialized property names.
+                // Retain the established serialization contract for known fields.
+                installed.merge(schema);
+                schema = installed;
+            }
+            let native = game.join("tools/redmod/metadata.json");
+            if native.is_file() {
+                schema.merge(Self::from_slice(&fs::read(native)?)?);
+            }
+        }
+        if let Some(path) = override_path {
+            schema.merge(Self::from_slice(&fs::read(path)?)?);
+        }
+        Ok(schema)
+    }
+
+    /// Loads the embedded serialization contract and game snapshot without filesystem access.
+    ///
+    /// # Errors
+    /// Returns an error if the embedded snapshot is invalid.
+    pub fn bundled() -> Result<Self, SchemaError> {
+        static BUNDLED: OnceLock<Result<RedSchema, String>> = OnceLock::new();
+        BUNDLED
+            .get_or_init(|| {
+                Self::from_slice(include_bytes!("../data/schema.json"))
+                    .and_then(|schema| {
+                        if schema.classes.is_empty() {
+                            return Err(SchemaError::Invalid(
+                                "bundled schema has no classes".into(),
+                            ));
+                        }
+                        let native = Self {
+                            classes: schema
+                                .classes
+                                .iter()
+                                .filter(|(_, class)| class.flags.is_some())
+                                .map(|(name, class)| (name.clone(), class.clone()))
+                                .collect(),
+                            ..Self::default()
+                        };
+                        let mut result = schema;
+                        result.merge(Self::from_slice(include_bytes!(
+                            "../data/serialization.json"
+                        ))?);
+                        result.merge(native);
+                        Ok(result)
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .clone()
+            .map_err(SchemaError::Invalid)
+    }
+
+    /// Returns reproducible fingerprints for the game snapshot and serialization definitions.
+    ///
+    /// # Errors
+    /// Returns an error if the embedded provenance is invalid.
+    pub fn bundled_provenance() -> Result<Provenance, SchemaError> {
+        let document: bundle::Document =
+            serde_json::from_slice(include_bytes!("../data/schema.json"))?;
+        let mut provenance = document.validate()?.provenance;
+        provenance.sources.push(Source {
+            path: "ghostline-red/data/serialization.json".into(),
+            sha1: format!(
+                "{:x}",
+                Sha1::digest(include_bytes!("../data/serialization.json"))
+            ),
+        });
+        Ok(provenance)
+    }
+
+    /// Loads installed game metadata and an explicitly supplied schema override.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable or malformed metadata.
+    pub fn from_game_files(game_root: &Path, schema_path: &Path) -> Result<Self, SchemaError> {
+        Self::load(Some(game_root), Some(schema_path))
+    }
     /// Parses either Ghostline's legacy class map or `REDmod` RTTI metadata.
     ///
     /// # Errors
@@ -74,10 +174,10 @@ impl RedSchema {
                             ("CEnum<", &mut result.enums),
                             ("CBitField<", &mut result.bitfields),
                         ] {
-                            if let Some((_, suffix)) = property.cs_type.split_once(prefix) {
-                                if let Some((name, _)) = suffix.split_once('>') {
-                                    types.insert(name.into());
-                                }
+                            if let Some((_, suffix)) = property.cs_type.split_once(prefix)
+                                && let Some((name, _)) = suffix.split_once('>')
+                            {
+                                types.insert(name.into());
                             }
                         }
                     }
@@ -85,6 +185,7 @@ impl RedSchema {
                 result
             }
             SchemaDocument::Redmod(metadata) => metadata.into(),
+            SchemaDocument::Bundled(document) => document.validate()?.schema,
         })
     }
 
@@ -144,6 +245,7 @@ impl RedSchema {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum SchemaDocument {
+    Bundled(bundle::Document),
     Redmod(RedmodMetadata),
     Legacy(BTreeMap<String, RedClass>),
 }
@@ -241,106 +343,103 @@ impl From<RedmodMetadata> for RedSchema {
     }
 }
 
-/// Extracts class inheritance and RED property names from generated `WolvenKit`
-/// class declarations and writes a deterministic JSON schema.
+/// Generates a versioned schema from installed `REDmod` metadata and the original
+/// game script bundle. Source fingerprints are stored with the schema.
 ///
 /// # Errors
-///
-/// Returns [`SchemaError`] if the source tree cannot be traversed, expressions
-/// cannot compile, or the output cannot be encoded.
-pub fn generate(wolvenkit: &Path, output: &Path) -> Result<usize, SchemaError> {
-    let class_re = Regex::new(
-        r"(?m)\b(?:partial\s+)?class\s+(?P<name>[A-Za-z0-9_]+)\s*(?::\s*(?P<base>[A-Za-z0-9_]+))?",
-    )?;
-    let red_alias_re = Regex::new(r#"\[RED\("(?P<alias>[^"]+)"\)\]\s*(?:public\s+)?$"#)?;
-    let property_re = Regex::new(
-        r#"(?s)(?:\[Ordinal\((?P<ordinal>\d+)\)\]\s*)?\[RED\("(?P<red>[^"]+)"[^\]]*\)\]\s*public\s+(?P<type>[A-Za-z0-9_<>,\s]+?)\s+[A-Za-z0-9_]+\s*\{"#,
-    )?;
-    let mut classes = BTreeMap::<String, RedClass>::new();
-    for path in cs_files(wolvenkit)? {
-        let text = fs::read_to_string(path)?;
-        let Some(class_capture) = class_re.captures(&text) else {
-            continue;
-        };
-        let class_start = class_capture.get(0).map_or(0, |capture| capture.start());
-        let mut prefix_start = class_start.saturating_sub(256);
-        while !text.is_char_boundary(prefix_start) {
-            prefix_start += 1;
-        }
-        let name = red_alias_re
-            .captures(&text[prefix_start..class_start])
-            .map_or_else(
-                || class_capture["name"].to_owned(),
-                |capture| capture["alias"].to_owned(),
-            );
-        let base = class_capture
-            .name("base")
-            .map(|value| value.as_str().to_owned());
-        let properties: BTreeMap<String, RedProperty> = property_re
-            .captures_iter(&text)
-            .map(|capture| {
-                let red_name = capture["red"].to_owned();
-                let cs_type = capture["type"]
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let ordinal = capture
-                    .name("ordinal")
-                    .and_then(|value| value.as_str().parse().ok());
-                (
-                    red_name,
-                    RedProperty {
-                        cs_type,
-                        ordinal,
-                        red_type: None,
-                        offset: None,
-                        flags: None,
-                    },
-                )
-            })
-            .collect();
-        classes
-            .entry(name)
-            .and_modify(|class| {
-                if class.base.is_none() {
-                    class.base.clone_from(&base);
-                }
-                class.properties.extend(properties.clone());
-            })
-            .or_insert(RedClass {
-                base,
-                properties,
-                flags: None,
-                size: None,
-                alignment: None,
-            });
-    }
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(output, serde_json::to_vec_pretty(&classes)?)?;
-    Ok(classes.len())
-}
-
-fn cs_files(root: &Path) -> Result<Vec<PathBuf>, io::Error> {
-    let mut files = Vec::new();
-    let mut pending = vec![root.to_owned()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(directory)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "cs") {
-                files.push(path);
-            }
-        }
-    }
-    Ok(files)
+/// Returns an error if either game input is absent, malformed or cannot be read.
+pub fn generate(game_root: &Path, output: &Path) -> Result<usize, SchemaError> {
+    bundle::generate(game_root, output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::RedSchema;
+
+    #[test]
+    fn bundled_retains_every_established_class_property_type_and_order() {
+        let mut expected =
+            RedSchema::from_slice(include_bytes!("../data/serialization.json")).unwrap();
+        let game = RedSchema::from_slice(include_bytes!("../data/schema.json")).unwrap();
+        expected.merge(RedSchema {
+            classes: game
+                .classes
+                .into_iter()
+                .filter(|(_, class)| class.flags.is_some())
+                .collect(),
+            ..RedSchema::default()
+        });
+        let actual = RedSchema::bundled().unwrap();
+        for (name, expected_class) in expected.classes {
+            let actual_class = actual
+                .classes
+                .get(&name)
+                .unwrap_or_else(|| panic!("missing class {name}"));
+            assert_eq!(actual_class.base, expected_class.base, "{name} base");
+            for (field, expected_property) in expected_class.properties {
+                let actual_property = actual_class
+                    .properties
+                    .get(&field)
+                    .unwrap_or_else(|| panic!("missing {name}.{field}"));
+                assert_eq!(
+                    serde_json::to_value(actual_property).unwrap(),
+                    serde_json::to_value(expected_property).unwrap(),
+                    "{name}.{field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_schema_contains_native_and_script_reflection() {
+        let schema = RedSchema::bundled().unwrap();
+        assert!(schema.classes.contains_key("scnSceneResource"));
+        assert!(schema.classes.contains_key("ABaseQuestObjectiveWrapper"));
+        assert!(
+            schema.classes["AIBaseUseWorkspotCommand"]
+                .properties
+                .contains_key("movementType")
+        );
+        let provenance = RedSchema::bundled_provenance().unwrap();
+        assert!(
+            provenance
+                .sources
+                .iter()
+                .any(|s| s.path == "r6/cache/final.redscripts")
+        );
+        assert!(
+            provenance
+                .sources
+                .iter()
+                .any(|s| s.path == "tools/redmod/metadata.json")
+        );
+        assert!(
+            provenance
+                .sources
+                .iter()
+                .all(|s| !s.path.contains("WolvenKit") && s.sha1.len() == 40)
+        );
+    }
+
+    #[test]
+    fn automatic_loader_needs_no_external_schema_and_applies_explicit_override_last() {
+        let root = tempfile::tempdir().unwrap();
+        let automatic = RedSchema::load(Some(root.path()), None).unwrap();
+        assert!(automatic.classes.contains_key("scnSceneResource"));
+        let path = root.path().join("override.json");
+        std::fs::write(&path, br#"{"CustomClass":{"base":"ISerializable","properties":{"value":{"cs_type":"CInt32","ordinal":0}}}}"#).unwrap();
+        let overridden = RedSchema::load(Some(root.path()), Some(&path)).unwrap();
+        assert!(overridden.classes.contains_key("CustomClass"));
+        assert!(overridden.classes.contains_key("scnSceneResource"));
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(RedSchema::load(None, Some(&path)).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_bundle_versions_and_invalid_script_bundles() {
+        assert!(RedSchema::from_slice(br#"{"format":"ghostline-red-schema","schema_version":99,"provenance":{"generator":"test","sources":[]},"schema":{}}"#).is_err());
+        assert!(super::scripts::read(b"not a script bundle").is_err());
+    }
 
     #[test]
     fn loads_legacy_class_map() {

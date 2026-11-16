@@ -10,7 +10,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    ffi::OsStr,
     fmt::Write as _,
     fs, io,
     path::Path,
@@ -34,12 +33,12 @@ pub enum CodecError {
 }
 
 struct Decoder<'a> {
+    buffer_payloads: bool,
     bytes: &'a [u8],
     file: &'a Cr2wInspection,
     classes: &'a BTreeSet<String>,
     enums: Option<&'a BTreeSet<String>>,
     bitfields: Option<&'a BTreeSet<String>>,
-    kraken_path: &'a OsStr,
 }
 
 /// Decodes all reflected CR2W exports to a dynamic JSON representation.
@@ -48,12 +47,8 @@ struct Decoder<'a> {
 ///
 /// Returns [`CodecError`] for malformed metadata, bounds violations, custom
 /// appendices, or RED value encodings not yet implemented.
-pub fn decode_exports(
-    path: &Path,
-    classes: &BTreeSet<String>,
-    kraken_path: &OsStr,
-) -> Result<Value, CodecError> {
-    decode_exports_inner(path, classes, None, None, kraken_path)
+pub fn decode_exports(path: &Path, classes: &BTreeSet<String>) -> Result<Value, CodecError> {
+    decode_exports_inner(path, classes, None, None)
 }
 
 /// Decodes reflected exports using official enum and bitfield categories.
@@ -64,16 +59,9 @@ pub fn decode_exports(
 pub fn decode_exports_with_red_schema(
     path: &Path,
     schema: &RedSchema,
-    kraken_path: &OsStr,
 ) -> Result<Value, CodecError> {
     let classes = schema.class_names();
-    decode_exports_inner(
-        path,
-        &classes,
-        Some(&schema.enums),
-        Some(&schema.bitfields),
-        kraken_path,
-    )
+    decode_exports_inner(path, &classes, Some(&schema.enums), Some(&schema.bitfields))
 }
 
 fn decode_exports_inner(
@@ -81,18 +69,22 @@ fn decode_exports_inner(
     classes: &BTreeSet<String>,
     enums: Option<&BTreeSet<String>>,
     bitfields: Option<&BTreeSet<String>>,
-    kraken_path: &OsStr,
 ) -> Result<Value, CodecError> {
     let file = cr2w::inspect(path)?;
     let bytes = fs::read(path)?;
     let decoder = Decoder {
+        buffer_payloads: true,
         bytes: &bytes,
         file: &file,
         classes,
         enums,
         bitfields,
-        kraken_path,
     };
+    decode_exports_document(&decoder)
+}
+
+fn decode_exports_document(decoder: &Decoder<'_>) -> Result<Value, CodecError> {
+    let file = decoder.file;
     let exports = file
         .exports
         .iter()
@@ -110,18 +102,62 @@ fn decode_exports_inner(
     Ok(json!({ "exports": exports }))
 }
 
+/// Reuses schema categories while decoding selected exports from multiple resources.
+pub struct SelectedExportDecoder<'a> {
+    schema: &'a RedSchema,
+    classes: BTreeSet<String>,
+}
+impl<'a> SelectedExportDecoder<'a> {
+    /// Indexes schema categories once for this resource batch.
+    pub fn new(schema: &'a RedSchema) -> Self {
+        Self {
+            schema,
+            classes: schema.class_names(),
+        }
+    }
+    /// Decodes selected native classes without traversing unrelated handles.
+    ///
+    /// # Errors
+    /// Returns native inspection or decoding errors for selected exports.
+    pub fn decode(
+        &self,
+        bytes: &[u8],
+        selected: &BTreeSet<String>,
+    ) -> Result<Vec<Value>, CodecError> {
+        let file = cr2w::inspect_bytes(bytes)?;
+        let decoder = Decoder {
+            buffer_payloads: true,
+            bytes,
+            file: &file,
+            classes: &self.classes,
+            enums: Some(&self.schema.enums),
+            bitfields: Some(&self.schema.bitfields),
+        };
+        file.exports
+            .iter()
+            .filter(|e| selected.contains(&e.class_name))
+            .map(|e| {
+                let start = usize::try_from(e.data_offset).map_err(|_| malformed(0, "offset"))?;
+                let size = usize::try_from(e.data_size).map_err(|_| malformed(start, "size"))?;
+                let (mut value, end) = decoder.read_class(&e.class_name, start, size)?;
+                if end != start + size {
+                    return Err(malformed(end, "selected export trailing bytes"));
+                }
+                value["$type"] = json!(e.class_name);
+                Ok(value)
+            })
+            .collect()
+    }
+}
+
 /// Decodes a CR2W file into the recursive handle shape used by `WKit` JSON.
 ///
 /// # Errors
 ///
 /// Returns [`CodecError`] under the same conditions as [`decode_exports`], or
 /// when an encoded handle points outside the export table.
-pub fn decode_wkit(
-    path: &Path,
-    classes: &BTreeSet<String>,
-    kraken_path: &OsStr,
-) -> Result<Value, CodecError> {
-    decode_wkit_inner(path, classes, None, None, kraken_path, None)
+pub fn decode_wkit(path: &Path, classes: &BTreeSet<String>) -> Result<Value, CodecError> {
+    decode_wkit_inner(path, classes, None, None, None)
 }
 
 /// Decodes a CR2W file using schema property order to reproduce `WolvenKit`
@@ -133,10 +169,9 @@ pub fn decode_wkit(
 pub fn decode_wkit_with_schema(
     path: &Path,
     classes: &BTreeMap<String, RedClass>,
-    kraken_path: &OsStr,
 ) -> Result<Value, CodecError> {
     let class_names = classes.keys().cloned().collect();
-    decode_wkit_inner(path, &class_names, None, None, kraken_path, Some(classes))
+    decode_wkit_inner(path, &class_names, None, None, Some(classes))
 }
 
 /// Decodes CR2W using official `REDmod` RTTI categories and property order.
@@ -144,18 +179,13 @@ pub fn decode_wkit_with_schema(
 /// # Errors
 ///
 /// Returns [`CodecError`] under the same conditions as [`decode_wkit`].
-pub fn decode_wkit_with_red_schema(
-    path: &Path,
-    schema: &RedSchema,
-    kraken_path: &OsStr,
-) -> Result<Value, CodecError> {
+pub fn decode_wkit_with_red_schema(path: &Path, schema: &RedSchema) -> Result<Value, CodecError> {
     let class_names = schema.class_names();
     decode_wkit_inner(
         path,
         &class_names,
         Some(&schema.enums),
         Some(&schema.bitfields),
-        kraken_path,
         Some(&schema.classes),
     )
 }
@@ -165,10 +195,82 @@ fn decode_wkit_inner(
     classes: &BTreeSet<String>,
     enums: Option<&BTreeSet<String>>,
     bitfields: Option<&BTreeSet<String>>,
-    kraken_path: &OsStr,
     schema: Option<&BTreeMap<String, RedClass>>,
 ) -> Result<Value, CodecError> {
-    let mut flat = decode_exports_inner(path, classes, enums, bitfields, kraken_path)?;
+    let bytes = fs::read(path)?;
+    let file = cr2w::inspect_bytes(&bytes)?;
+    let decoder = Decoder {
+        buffer_payloads: true,
+        bytes: &bytes,
+        file: &file,
+        classes,
+        enums,
+        bitfields,
+    };
+    decode_wkit_document(&decoder, &path.to_string_lossy(), schema)
+}
+
+/// Decodes native CR2W bytes using reflected RED types and handle identities.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] for malformed resources, unsupported values or invalid handles.
+pub fn decode_wkit_from_bytes(bytes: &[u8], schema: &RedSchema) -> Result<Value, CodecError> {
+    let file = cr2w::inspect_bytes(bytes)?;
+    let classes = schema.class_names();
+    let decoder = Decoder {
+        buffer_payloads: true,
+        bytes,
+        file: &file,
+        classes: &classes,
+        enums: Some(&schema.enums),
+        bitfields: Some(&schema.bitfields),
+    };
+    decode_wkit_document(&decoder, "", Some(&schema.classes))
+}
+
+/// Decodes reflected metadata while leaving table-buffer payloads unloaded.
+///
+/// # Errors
+/// Returns native decoding errors for malformed metadata or handles.
+pub fn decode_metadata_from_bytes(bytes: &[u8], schema: &RedSchema) -> Result<Value, CodecError> {
+    let file = cr2w::inspect_bytes(bytes)?;
+    let classes = schema.class_names();
+    let decoder = Decoder {
+        buffer_payloads: false,
+        bytes,
+        file: &file,
+        classes: &classes,
+        enums: Some(&schema.enums),
+        bitfields: Some(&schema.bitfields),
+    };
+    decode_wkit_document(&decoder, "", Some(&schema.classes))
+}
+
+/// Reads and decompresses one native table buffer without expanding other buffers.
+///
+/// # Errors
+/// Returns a native inspection/decompression error for an invalid buffer.
+pub fn decode_table_buffer(bytes: &[u8], index: usize) -> Result<Vec<u8>, CodecError> {
+    let file = cr2w::inspect_bytes(bytes)?;
+    let classes = BTreeSet::new();
+    let decoder = Decoder {
+        buffer_payloads: true,
+        bytes,
+        file: &file,
+        classes: &classes,
+        enums: None,
+        bitfields: None,
+    };
+    Ok(decoder.buffer(index, 0, false)?.1)
+}
+
+fn decode_wkit_document(
+    decoder: &Decoder<'_>,
+    source_name: &str,
+    schema: Option<&BTreeMap<String, RedClass>>,
+) -> Result<Value, CodecError> {
+    let mut flat = decode_exports_document(decoder)?;
     let wrapped_exports = flat
         .get_mut("exports")
         .and_then(Value::as_array_mut)
@@ -183,8 +285,8 @@ fn decode_wkit_inner(
                 .ok_or_else(|| malformed(0, "export value"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let inspection = cr2w::inspect(path)?;
-    let handle_ids = reachable_handle_ids(&exports, &inspection, schema)?;
+    let inspection = decoder.file;
+    let handle_ids = reachable_handle_ids(&exports, inspection, schema)?;
     let root = exports.first().ok_or_else(|| malformed(0, "root export"))?;
     let mut visited = HashSet::new();
     let root = expand_handles(root, &exports, &handle_ids, &mut visited)?;
@@ -229,7 +331,7 @@ fn decode_wkit_inner(
             "GameVersion": 2310,
             "ExportedDateTime": "1970-01-01T00:00:00Z",
             "DataType": "CR2W",
-            "ArchiveFileName": path.to_string_lossy()
+            "ArchiveFileName": source_name
         },
         "Data": data
     }))
@@ -443,6 +545,31 @@ impl Decoder<'_> {
                 end,
             ));
         }
+        if red_type == "Variant" && size >= 6 {
+            let inner = self.name(usize::from(self.u16(start)?), start)?.to_owned();
+            if matches!(
+                inner.as_str(),
+                "Int32" | "Bool" | "Float" | "CName" | "String"
+            ) {
+                let payload_size = usize::try_from(self.u32(start + 2)?)
+                    .map_err(|_| malformed(start, "variant size"))?
+                    .checked_sub(4)
+                    .ok_or_else(|| malformed(start, "variant size"))?;
+                let payload_start = start + 6;
+                let variant_end = payload_start.checked_add(payload_size)
+                    .filter(|value| *value <= end)
+                    .ok_or_else(|| malformed(start, "variant bounds"))?;
+                let (value, consumed) = self.read_value(&inner, payload_start, payload_size)?;
+                if consumed != variant_end {
+                    return Err(malformed(consumed, "variant trailing bytes"));
+                }
+                return Ok((
+                    json!({"$type":"Variant","value_type":inner,"value":value,
+                    "$rawData":STANDARD.encode(&self.bytes[start..variant_end])}),
+                    variant_end,
+                ));
+            }
+        }
         if is_opaque_custom_data(red_type) {
             return Ok(self.read_opaque_custom_data(red_type, start, end));
         }
@@ -543,14 +670,12 @@ impl Decoder<'_> {
                 .and_then(Value::as_str)
                 .unwrap_or("direct")
                 == "direct"
+            && let Ok(index) = self.u16(cursor)
+            && let Ok(name) = self.name(usize::from(index), cursor)
         {
-            if let Ok(index) = self.u16(cursor) {
-                if let Ok(name) = self.name(usize::from(index), cursor) {
-                    object.insert("unk1".into(), json!([storage_string("CName", name)]));
-                    object.insert("unk2".into(), json!([]));
-                    return end;
-                }
-            }
+            object.insert("unk1".into(), json!([storage_string("CName", name)]));
+            object.insert("unk2".into(), json!([]));
+            return end;
         }
         if cursor >= end || !is_opaque_appendix(red_type) {
             return cursor;
@@ -578,13 +703,14 @@ impl Decoder<'_> {
         end: usize,
         object: &mut Map<String, Value>,
     ) -> Result<usize, CodecError> {
-        object.insert("version".to_owned(), json!(self.u32(cursor)?.cast_signed()));
+        let version = self.u32(cursor)?;
+        object.insert("version".to_owned(), json!(version.cast_signed()));
         cursor += 4;
         let _inner_size = self.u32(cursor)?;
         cursor += 4;
         object.insert(
             "nodeData".to_owned(),
-            self.world_node_buffer(self.u32(cursor)?, cursor)?,
+            self.world_node_buffer(self.u32(cursor)?, cursor, version)?,
         );
         cursor += 4;
 
@@ -774,13 +900,26 @@ impl Decoder<'_> {
                     .and_then(|start| start.checked_add(length))
                     .filter(|payload_end| *payload_end <= end)
                     .ok_or_else(|| malformed(start, "shared buffer bounds"))?;
-                Ok((
+                let bytes = &self.bytes[start + 4..payload_end];
+                let value = if bytes.starts_with(b"CR2W") {
+                    let file = cr2w::inspect_bytes(bytes)?;
+                    let decoder = Decoder {
+                        buffer_payloads: self.buffer_payloads,
+                        bytes,
+                        file: &file,
+                        classes: self.classes,
+                        enums: self.enums,
+                        bitfields: self.bitfields,
+                    };
+                    let document = decode_wkit_document(&decoder, "", None)?;
+                    json!({"Flags":0,"Type":"WolvenKit.RED4.Archive.Buffer.CR2WWrapper, WolvenKit.RED4, Version=8.17.4.0, Culture=neutral, PublicKeyToken=null","Data":{"File":document["Data"]}})
+                } else {
                     json!({
                         "Flags": 0,
-                        "Bytes": STANDARD.encode(&self.bytes[start + 4..payload_end])
-                    }),
-                    payload_end,
-                ))
+                        "Bytes": STANDARD.encode(bytes)
+                    })
+                };
+                Ok((value, payload_end))
             }
             "DataBuffer" => self.data_buffer(self.u32(start)?, start, end),
             "serializationDeferredDataBuffer" => {
@@ -791,6 +930,7 @@ impl Decoder<'_> {
                     exact(self.table_buffer(usize::from(encoded - 1), start)?)
                 }
             }
+            "Variant" => self.read_class(red_type, start, size),
             "CGUID" => exact(json!({"$type": "CGUID", "$bytes": hex(&self.bytes[start..end])})),
             _ if is_opaque_custom_data(red_type) => {
                 Ok(self.read_opaque_custom_data(red_type, start, end))
@@ -1203,6 +1343,14 @@ impl Decoder<'_> {
     }
 
     fn table_buffer(&self, index: usize, offset: usize) -> Result<Value, CodecError> {
+        if !self.buffer_payloads {
+            let buffer = self
+                .file
+                .buffers
+                .get(index)
+                .ok_or_else(|| malformed(offset, "buffer index"))?;
+            return Ok(json!({"BufferId":index.to_string(),"Flags":buffer.flags}));
+        }
         let (buffer, bytes, stored) = self.buffer(index, offset, true)?;
         if stored {
             return Ok(json!({
@@ -1258,7 +1406,12 @@ impl Decoder<'_> {
         }))
     }
 
-    fn world_node_buffer(&self, encoded: u32, offset: usize) -> Result<Value, CodecError> {
+    fn world_node_buffer(
+        &self,
+        encoded: u32,
+        offset: usize,
+        version: u32,
+    ) -> Result<Value, CodecError> {
         if encoded <= 0x8000_0000 {
             return Err(malformed(offset, "world node buffer pointer"));
         }
@@ -1285,7 +1438,7 @@ impl Decoder<'_> {
                     entry[at + 7],
                 ])
             };
-            entries.push(json!({
+            let mut decoded = json!({
                 "Id": u64_at(80).to_string(),
                 "NodeIndex": u16_at(120),
                 "Position": {"$type":"Vector4","W":f32_at(12),"X":f32_at(0),"Y":f32_at(4),"Z":f32_at(8)},
@@ -1310,10 +1463,30 @@ impl Decoder<'_> {
                 "Uk12":u16_at(126),
                 "Uk13":u64_at(128).to_string(),
                 "Uk14":u64_at(136).to_string()
-            }));
+            });
+            if version >= 68 {
+                let bits = u64_at(112);
+                decoded["NodeIndex"] = json!(bits & 0x7_ffff);
+                decoded["NodeFlags"] = json!((bits >> 19) & 0x1f_ffff);
+                decoded["StreamingPriority"] = json!((bits >> 40) & 0xff);
+                decoded["TimeOfDayMask"] = json!(bits >> 48);
+                decoded["MaxStreamingDistance"] = json!(f32_at(120));
+                decoded["UkFloat1"] = json!(f32_at(124));
+                decoded["InstanceIndex"] = json!(u32::from_le_bytes(
+                    entry[128..132].try_into().expect("four-byte slice")
+                ));
+                decoded["DataGroup"] = json!(entry[132]);
+                decoded["Padding"] = json!(entry[133..144]);
+                let object = decoded.as_object_mut().expect("node object");
+                for name in ["Uk10", "Uk11", "Uk12", "Uk13", "Uk14"] {
+                    object.remove(name);
+                }
+            }
+            entries.push(decoded);
         }
         Ok(json!({
             "BufferId": index.to_string(),
+            "Version": version,
             "Flags": buffer.flags,
             "Type": "WolvenKit.RED4.Archive.Buffer.worldNodeDataBuffer, WolvenKit.RED4, Version=8.17.4.0, Culture=neutral, PublicKeyToken=null",
             "Data": entries
@@ -1348,12 +1521,11 @@ impl Decoder<'_> {
                     .try_into()
                     .map_err(|_| malformed(start, "KARK header"))?,
             );
-            match archive::decompress_payload_isolated(
+            match archive::decompress_payload(
                 stored
                     .get(8..)
                     .ok_or_else(|| malformed(start, "KARK payload"))?,
                 usize::try_from(declared).map_err(|_| malformed(start, "KARK size"))?,
-                self.kraken_path,
             ) {
                 Ok(bytes) => (bytes, false),
                 Err(_) if allow_stored_fallback => (stored.to_vec(), true),
@@ -1415,7 +1587,7 @@ fn fixed_size(red_type: &str) -> Option<usize> {
 fn is_variable_size(red_type: &str) -> bool {
     matches!(
         red_type,
-        "String" | "NodeRef" | "LocalizationString" | "DataBuffer" | "SharedDataBuffer"
+        "String" | "NodeRef" | "LocalizationString" | "DataBuffer" | "SharedDataBuffer" | "Variant"
     ) || red_type.starts_with("array:")
         || red_type.starts_with("static:")
         || red_type.starts_with('[')
@@ -1442,7 +1614,6 @@ fn is_opaque_custom_data(red_type: &str) -> bool {
         red_type,
         "Variant"
             | "AITrafficWorkspotCompiled"
-            | "animAnimationBufferCompressed"
             | "gameCompiledSmartObjectData"
             | "gameSmartObjectAnimationDatabase"
             | "worldCompiledEffectInfo"
@@ -1463,6 +1634,14 @@ fn is_opaque_appendix(red_type: &str) -> bool {
             | "physicsMaterialLibraryResource"
             | "scnAnimName"
             | "worldInstancedMeshNode"
+            | "worldCookedCollisionNode"
+            | "worldCookedAcousticSectorNode"
+            | "worldCookedGenericProxyMeshNode"
+            | "worldCookedStaticDecalNode"
+            | "worldCookedStaticMeshNode"
+            | "worldCookedBendedMeshNode"
+            | "worldCookedCableMeshNode"
+            | "worldCookedFoliageDestructionNode"
             | "worldInstancedOccluderNode"
             | "worldTrafficCompiledNode"
             | "worldTrafficLanesSpotsResource"
@@ -1493,7 +1672,7 @@ pub(crate) fn fixed_curve_class_size(red_type: &str) -> Option<usize> {
     }
 }
 
-fn interpolation_type(value: u8) -> Option<&'static str> {
+pub(crate) fn interpolation_type(value: u8) -> Option<&'static str> {
     [
         "Constant",
         "Linear",
@@ -1505,7 +1684,7 @@ fn interpolation_type(value: u8) -> Option<&'static str> {
     .copied()
 }
 
-fn segment_link_type(value: u8) -> Option<&'static str> {
+pub(crate) fn segment_link_type(value: u8) -> Option<&'static str> {
     ["ESLT_Normal", "ESLT_Smooth", "ESLT_SmoothSymmetric"]
         .get(usize::from(value))
         .copied()

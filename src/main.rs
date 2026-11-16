@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tempfile::NamedTempFile;
+mod name_scan;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,27 +68,68 @@ struct Cr2wSerializeBatchOutcome {
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Optional Kraken library used only by explicit native diagnostic flags.
-    #[arg(long, global = true, default_value = "kraken.dll")]
-    kraken: PathBuf,
+    /// Overlay reflection from this game installation; bundled metadata is always available.
+    #[arg(long, global = true)]
+    game: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(hide = true)]
-    KrakenCompressWorker,
-    #[command(hide = true)]
-    KrakenDecompressWorker,
-    /// Encode a DLL-free Kraken stream with entropy and LZ compression.
-    KrakenEncode {
-        input: PathBuf,
-        output: PathBuf,
-        /// Prefer the crash-isolated native compressor for differential diagnosis.
+    /// Find literal and hashed CNames in scene/animation main metadata.
+    ScanEventNames {
         #[arg(long)]
-        native: bool,
+        names: PathBuf,
+        #[arg(long)]
+        patterns: PathBuf,
+        /// Restrict the audit to newline-separated depot paths.
+        #[arg(long)]
+        resources: Option<PathBuf>,
+        /// Search every CR2W resource type, retaining only matches in the report.
+        #[arg(long)]
+        all_resource_types: bool,
+        /// Also inspect deferred entity, appearance, graph and effect-set metadata.
+        #[arg(long)]
+        include_event_buffers: bool,
+        /// Decode matching RED packages to classify field-level references.
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
     },
+    /// Decode one native world collider and write independently cooked static meshes.
+    CollisionGeometry {
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        #[arg(long)]
+        sector: String,
+        #[arg(long)]
+        placement: usize,
+        #[arg(long)]
+        actor: usize,
+        #[arg(long, default_value_t = 0)]
+        shape: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Inspect compiled `TweakDB` tables and exact record properties.
+    TweakdbInspect {
+        input: PathBuf,
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        /// Native record name or decimal `TweakDBID`.
+        #[arg(long)]
+        record: Option<String>,
+        /// Export every record in a reflected class (including derived classes).
+        #[arg(long, conflicts_with = "record")]
+        record_class: Option<String>,
+        /// Property name; may be repeated.
+        #[arg(long)]
+        property: Vec<String>,
+    },
+    /// Encode a Kraken stream with entropy and LZ compression.
+    KrakenEncode { input: PathBuf, output: PathBuf },
     /// Decode a Kraken stream with the clean-room backend.
     KrakenDecode {
         input: PathBuf,
@@ -95,9 +137,6 @@ enum Command {
         /// Exact number of uncompressed bytes expected.
         #[arg(long)]
         size: usize,
-        /// Fall back to the crash-isolated native library when clean decoding is unsupported.
-        #[arg(long)]
-        native_fallback: bool,
     },
     /// Pack a loose depot tree into an archive.
     Pack {
@@ -134,11 +173,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Decode reflected CR2W exports with a generated RED schema.
+    /// Decode reflected CR2W exports using bundled metadata and optional overlays.
     Cr2wDecode {
         input: PathBuf,
         /// Schema sources in increasing precedence order.
-        #[arg(long, required = true)]
+        #[arg(long)]
         schema: Vec<PathBuf>,
         output: PathBuf,
     },
@@ -146,7 +185,7 @@ enum Command {
     Cr2wSerialize {
         input: PathBuf,
         /// Schema sources in increasing precedence order.
-        #[arg(long, required = true)]
+        #[arg(long)]
         schema: Vec<PathBuf>,
         output: PathBuf,
     },
@@ -154,11 +193,8 @@ enum Command {
     Cr2wSerializeBatch {
         manifest: PathBuf,
         /// Schema sources in increasing precedence order.
-        #[arg(long, required = true)]
-        schema: Vec<PathBuf>,
-        /// Root containing the game's content, expansion, hotfix, and mod archives.
         #[arg(long)]
-        archives_root: PathBuf,
+        schema: Vec<PathBuf>,
         /// Machine-readable per-job outcome report.
         #[arg(long)]
         report: PathBuf,
@@ -172,7 +208,7 @@ enum Command {
         #[arg(long)]
         template: Option<PathBuf>,
         /// Schema sources in increasing precedence order.
-        #[arg(long, required = true)]
+        #[arg(long)]
         schema: Vec<PathBuf>,
         output: PathBuf,
     },
@@ -189,21 +225,18 @@ enum Command {
     MeshExport {
         input: PathBuf,
         /// Schema sources in increasing precedence order.
-        #[arg(long, required = true)]
+        #[arg(long)]
         schema: Vec<PathBuf>,
         #[arg(short, long)]
         output: PathBuf,
         /// Include every LOD instead of only the first render LOD.
         #[arg(long)]
         all_lods: bool,
-        /// Index game archives and export the mesh's complete material dependency graph.
-        #[arg(long, requires = "material_repo")]
-        archives_root: Option<PathBuf>,
         /// Destination for uncooked textures, masks, and material documents.
-        #[arg(long, requires = "archives_root")]
+        #[arg(long, requires = "game")]
         material_repo: Option<PathBuf>,
         /// Export only the materials needed by this mesh appearance.
-        #[arg(long, requires = "archives_root")]
+        #[arg(long, requires = "game")]
         appearance: Option<String>,
         /// Bake selected Cyberpunk materials to standard glTF PBR textures.
         #[arg(long, requires = "appearance")]
@@ -216,11 +249,8 @@ enum Command {
     MeshExportBatch {
         manifest: PathBuf,
         /// Schema sources in increasing precedence order.
-        #[arg(long, required = true)]
-        schema: Vec<PathBuf>,
-        /// Root containing the game's content, expansion, hotfix, and mod archives.
         #[arg(long)]
-        archives_root: PathBuf,
+        schema: Vec<PathBuf>,
         /// Shared destination for decoded material dependencies.
         #[arg(
             long,
@@ -254,8 +284,8 @@ enum Command {
         #[arg(long, default_value_t = 512)]
         size: u32,
     },
-    /// Generate compact RED class/property metadata from `WolvenKit` source.
-    SchemaGenerate { wolvenkit: PathBuf, output: PathBuf },
+    /// Generate a versioned reflection bundle from original installed game data.
+    SchemaGenerate { output: PathBuf },
 }
 
 #[expect(
@@ -264,31 +294,122 @@ enum Command {
 )]
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let load_schemas = |paths: &[PathBuf]| load_schemas(paths, cli.game.as_deref());
+    let archives_root = || -> Result<PathBuf> {
+        Ok(cli
+            .game
+            .as_deref()
+            .context("--game is required to read installed archives")?
+            .join("archive/pc"))
+    };
     match cli.command {
-        Command::KrakenCompressWorker => {
-            let mut input = Vec::new();
-            std::io::stdin().read_to_end(&mut input)?;
-            let output = archive::compress_worker_batch(&input, cli.kraken.as_os_str())?;
-            std::io::stdout().write_all(&output)?;
-        }
-        Command::KrakenDecompressWorker => {
-            let mut input = Vec::new();
-            std::io::stdin().read_to_end(&mut input)?;
-            let output = archive::decompress_worker(&input, cli.kraken.as_os_str())?;
-            std::io::stdout().write_all(&output)?;
-        }
-        Command::KrakenEncode {
-            input,
-            output,
-            native,
+        Command::CollisionGeometry {
+            schema,
+            sector,
+            placement,
+            actor,
+            shape,
+            out,
         } => {
+            let schema = load_schemas(schema.as_slice())?;
+            let archives = material::ArchiveSet::open(&archives_root()?)?;
+            let mut reader = ghostline_red::assets::AssetReader::new(&archives, &schema);
+            let document = reader.document(&ghostline_red::assets::ResourceKey::parse(&sector))?;
+            let root = &document["Data"]["RootChunk"];
+            let index = root["nodeData"]["Data"][placement]["NodeIndex"]
+                .as_u64()
+                .context("Collision placement absent")? as usize;
+            let node = &root["nodes"][index]["Data"];
+            let selected = ghostline_red::world::collision_shapes(node)?
+                .into_iter()
+                .find(|s| s.actor == actor && s.shape == shape)
+                .context("Collision shape absent")?;
+            let sector = node["sectorHash"]
+                .as_u64()
+                .or_else(|| node["sectorHash"].as_str().and_then(|v| v.parse().ok()))
+                .context("Collision sector identity absent")?;
+            let geometry = reader.collision_geometry(
+                sector,
+                selected
+                    .geometry
+                    .context("Selected shape is not a cooked collider")?,
+            )?;
+            fs::create_dir_all(&out)?;
+            fs::write(
+                out.join("geometry.json"),
+                serde_json::to_vec_pretty(&*geometry)?,
+            )?;
+            for (i, bytes) in geometry.cook()?.iter().enumerate() {
+                fs::write(out.join(format!("cooked-{i}.bin")), bytes)?;
+            }
+            println!(
+                "{}",
+                serde_json::json!({"vertices":geometry.vertices.len(),"triangles":geometry.triangles.len(),"source":selected})
+            );
+        }
+        Command::ScanEventNames {
+            names,
+            patterns,
+            resources,
+            all_resource_types,
+            include_event_buffers,
+            schema,
+            output,
+        } => {
+            name_scan::run(
+                cli.game
+                    .as_deref()
+                    .context("name scanning requires --game")?,
+                &names,
+                &patterns,
+                resources.as_deref(),
+                all_resource_types,
+                include_event_buffers,
+                schema.as_deref(),
+                &output,
+            )?;
+        }
+        Command::TweakdbInspect {
+            input,
+            schema,
+            record,
+            record_class,
+            property,
+        } => {
+            use ghostline_red::tweakdb::{RecordTypes, TweakDb, TweakId};
+            let db = TweakDb::from_bytes(&fs::read(&input)?)?;
+            let types = RecordTypes::new(&load_schemas(schema.as_slice())?);
+            let mut classes = std::collections::BTreeMap::<String, usize>::new();
+            for hash in db.records.values() {
+                *classes
+                    .entry(
+                        types
+                            .name(*hash)
+                            .map_or_else(|| format!("unknown:{hash}"), str::to_owned),
+                    )
+                    .or_default() += 1;
+            }
+            let selected = record.map(|name| {
+                let id = name.parse().map_or_else(|_| TweakId::from_name(&name), TweakId);
+                serde_json::json!({"id":id,"class":db.records.get(&id).and_then(|h|types.name(*h)),"properties":property.iter().map(|p|(p,db.property(id,p))).collect::<std::collections::BTreeMap<_,_>>()})
+            });
+            let matching_records = record_class.map(|class| {
+                db.records.iter().filter(|(_, hash)| types.is_a(**hash, &class)).map(|(id, hash)| {
+                    serde_json::json!({"id":id,"class":types.name(*hash),"properties":property.iter().map(|p|(p,db.property(*id,p))).collect::<std::collections::BTreeMap<_,_>>()})
+                }).collect::<Vec<_>>()
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "records":db.records.len(),"flats":db.flats.len(),"queries":db.queries.len(),"group_tags":db.group_tags.len(),
+                    "item_records":db.records.values().filter(|h|types.is_a(**h,"gamedataItem_Record")).count(),"classes":classes,"selected":selected,"matching_records":matching_records
+                }))?
+            );
+        }
+        Command::KrakenEncode { input, output } => {
             let decoded =
                 fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
-            let encoded = if native {
-                archive::compress_payload_native_worker(&decoded, cli.kraken.as_os_str())
-            } else {
-                kraken::encode(&decoded)
-            };
+            let encoded = kraken::encode(&decoded);
             fs::write(&output, encoded)
                 .with_context(|| format!("failed to write {}", output.display()))?;
         }
@@ -296,17 +417,11 @@ fn main() -> Result<()> {
             input,
             output,
             size,
-            native_fallback,
         } => {
             let encoded =
                 fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
-            let decoded = if native_fallback {
-                archive::decompress_payload_native_fallback(&encoded, size, cli.kraken.as_os_str())
-                    .with_context(|| format!("failed to decode {}", input.display()))?
-            } else {
-                kraken::decode(&encoded, size)
-                    .with_context(|| format!("failed to decode {}", input.display()))?
-            };
+            let decoded = kraken::decode(&encoded, size)
+                .with_context(|| format!("failed to decode {}", input.display()))?;
             fs::write(&output, decoded)
                 .with_context(|| format!("failed to write {}", output.display()))?;
         }
@@ -317,7 +432,7 @@ fn main() -> Result<()> {
                 .and_then(|name| name.to_str())
                 .unwrap_or("archive");
             let candidate = output.join(format!("{name}.archive"));
-            archive::pack(&source, &candidate, cli.kraken.as_os_str())?;
+            archive::pack(&source, &candidate)?;
             println!("{}", candidate.display());
         }
         Command::Extract {
@@ -328,14 +443,9 @@ fn main() -> Result<()> {
         } => {
             fs::create_dir_all(&output)?;
             if let Some(depot_path) = depot_path {
-                archive::extract_path(&path, &output, &depot_path, cli.kraken.as_os_str())?;
+                archive::extract_path(&path, &output, &depot_path)?;
             } else {
-                archive::extract(
-                    &path,
-                    &output,
-                    cli.kraken.as_os_str(),
-                    paths_root.as_deref(),
-                )?;
+                archive::extract(&path, &output, paths_root.as_deref())?;
             }
         }
         Command::ArchiveList {
@@ -346,7 +456,7 @@ fn main() -> Result<()> {
             let mut index = archive::read_archive(&path)
                 .with_context(|| format!("failed to inspect {}", path.display()))?;
             if index.custom_paths.is_empty() {
-                index.custom_paths = archive::read_archive_paths(&path, cli.kraken.as_os_str())?;
+                index.custom_paths = archive::read_archive_paths(&path)?;
             }
             let names = paths_root
                 .as_deref()
@@ -416,8 +526,7 @@ fn main() -> Result<()> {
             output,
         } => {
             let schema = load_schemas(&schema)?;
-            let document =
-                codec::decode_exports_with_red_schema(&input, &schema, cli.kraken.as_os_str())?;
+            let document = codec::decode_exports_with_red_schema(&input, &schema)?;
             fs::write(output, serde_json::to_vec_pretty(&document)?)?;
         }
         Command::Cr2wSerialize {
@@ -426,14 +535,12 @@ fn main() -> Result<()> {
             output,
         } => {
             let schema = load_schemas(&schema)?;
-            let document =
-                codec::decode_wkit_with_red_schema(&input, &schema, cli.kraken.as_os_str())?;
+            let document = codec::decode_wkit_with_red_schema(&input, &schema)?;
             fs::write(output, serde_json::to_vec_pretty(&document)?)?;
         }
         Command::Cr2wSerializeBatch {
             manifest,
             schema,
-            archives_root,
             report,
             threads,
         } => {
@@ -443,7 +550,7 @@ fn main() -> Result<()> {
                     .with_context(|| format!("failed to read manifest {}", manifest.display()))?,
             )
             .with_context(|| format!("failed to parse manifest {}", manifest.display()))?;
-            let archives = material::ArchiveSet::open(&archives_root)?;
+            let archives = material::ArchiveSet::open(&archives_root()?)?;
             let job_count = manifest.jobs.len();
             let thread_count = if threads == 0 {
                 std::thread::available_parallelism().map_or(1, usize::from)
@@ -458,12 +565,7 @@ fn main() -> Result<()> {
                     .jobs
                     .into_par_iter()
                     .map(|job| {
-                        let result = serialize_archive_resource(
-                            &job,
-                            &schema,
-                            &archives,
-                            cli.kraken.as_os_str(),
-                        );
+                        let result = serialize_archive_resource(&job, &schema, &archives);
                         let position = completed.fetch_add(1, Ordering::Relaxed) + 1;
                         eprintln!("[{position}/{job_count}] {}", job.resource);
                         Cr2wSerializeBatchOutcome {
@@ -498,13 +600,7 @@ fn main() -> Result<()> {
         } => {
             let schema = load_schemas(&schema)?;
             if let Some(template) = template {
-                writer::write_with_red_schema(
-                    &input,
-                    &template,
-                    &output,
-                    &schema,
-                    cli.kraken.as_os_str(),
-                )?;
+                writer::write_with_red_schema(&input, &template, &output, &schema)?;
             } else {
                 writer::write(&input, &output, &schema)?;
             }
@@ -524,16 +620,15 @@ fn main() -> Result<()> {
             schema,
             output,
             all_lods,
-            archives_root,
             material_repo,
             appearance,
             pbr,
             pbr_size,
         } => {
             let schema = load_schemas(&schema)?;
-            mesh::export_glb(&input, &schema, &output, cli.kraken.as_os_str(), !all_lods)?;
-            if let (Some(archives_root), Some(material_repo)) = (archives_root, material_repo) {
-                let archives = material::ArchiveSet::open(&archives_root)?;
+            mesh::export_glb(&input, &schema, &output, !all_lods)?;
+            if let Some(material_repo) = material_repo {
+                let archives = material::ArchiveSet::open(&archives_root()?)?;
                 let sidecar = output.with_extension("Material.json");
                 let summary = material::export_mesh_materials(
                     &input,
@@ -541,8 +636,8 @@ fn main() -> Result<()> {
                     &archives,
                     &material_repo,
                     &sidecar,
-                    cli.kraken.as_os_str(),
                     appearance.as_deref(),
+                    pbr,
                 )?;
                 eprintln!(
                     "{} materials, {} dependencies ({} textures, {} masks)",
@@ -565,7 +660,6 @@ fn main() -> Result<()> {
         Command::MeshExportBatch {
             manifest,
             schema,
-            archives_root,
             material_repo,
             geometry_only,
             report,
@@ -576,7 +670,7 @@ fn main() -> Result<()> {
             let schema = load_schemas(&schema)?;
             let manifest: MeshExportBatchManifest = serde_json::from_slice(&fs::read(&manifest)?)?;
             validate_mesh_export_batch_outputs(&manifest.jobs)?;
-            let archives = material::ArchiveSet::open(&archives_root)?;
+            let archives = material::ArchiveSet::open(&archives_root()?)?;
             let job_count = manifest.jobs.len();
             let thread_count = if threads == 0 {
                 std::thread::available_parallelism().map_or(1, usize::from)
@@ -600,7 +694,6 @@ fn main() -> Result<()> {
                             &schema,
                             &archives,
                             material_repo.as_deref(),
-                            cli.kraken.as_os_str(),
                             pbr,
                             pbr_size,
                         );
@@ -668,8 +761,13 @@ fn main() -> Result<()> {
                 summary.materials, summary.generated_textures, summary.reused_textures
             );
         }
-        Command::SchemaGenerate { wolvenkit, output } => {
-            let count = schema::generate(&wolvenkit, &output)?;
+        Command::SchemaGenerate { output } => {
+            let count = schema::generate(
+                cli.game
+                    .as_deref()
+                    .context("schema generation requires --game")?,
+                &output,
+            )?;
             println!("wrote {count} RED classes to {}", output.display());
         }
     }
@@ -698,8 +796,8 @@ fn load_depot_paths(root: &Path) -> Result<HashMap<u64, String>> {
     Ok(result)
 }
 
-fn load_schemas(paths: &[PathBuf]) -> Result<schema::RedSchema> {
-    let mut result = schema::RedSchema::default();
+fn load_schemas(paths: &[PathBuf], game: Option<&Path>) -> Result<schema::RedSchema> {
+    let mut result = schema::RedSchema::load(game, None)?;
     for path in paths {
         result.merge(
             schema::RedSchema::from_slice(
@@ -717,20 +815,19 @@ fn run_mesh_export_batch_job(
     schema: &schema::RedSchema,
     archives: &material::ArchiveSet,
     material_repo: Option<&Path>,
-    kraken_path: &std::ffi::OsStr,
     pbr: bool,
     pbr_size: u32,
 ) -> MeshExportBatchErrors {
     let geometry = (|| -> Result<NamedTempFile> {
         let bytes = archives
-            .read_resource(&job.mesh, kraken_path)
+            .read_resource(&job.mesh)
             .with_context(|| format!("failed to read archive mesh {}", job.mesh))?;
         let mut input = NamedTempFile::new()
             .with_context(|| format!("failed to create temporary input for {}", job.mesh))?;
         input
             .write_all(&bytes)
             .with_context(|| format!("failed to stage archive mesh {}", job.mesh))?;
-        mesh::export_glb(input.path(), schema, &job.output, kraken_path, true)
+        mesh::export_glb(input.path(), schema, &job.output, true)
             .with_context(|| format!("failed to export GLB for {}", job.mesh))?;
         Ok(input)
     })();
@@ -751,8 +848,8 @@ fn run_mesh_export_batch_job(
             archives,
             material_repo,
             &sidecar,
-            kraken_path,
             job.appearance.as_deref(),
+            pbr,
         )
         .with_context(|| format!("failed to export material sidecar for {}", job.mesh))?;
         Ok(())
@@ -882,10 +979,14 @@ fn serialize_archive_resource(
     job: &Cr2wSerializeBatchJob,
     schema: &schema::RedSchema,
     archives: &material::ArchiveSet,
-    kraken_path: &std::ffi::OsStr,
 ) -> Result<()> {
-    let bytes = archives
-        .read_resource(&job.resource, kraken_path)
+    let bytes = job
+        .resource
+        .parse::<u64>()
+        .map_or_else(
+            |_| archives.read_resource(&job.resource),
+            |hash| archives.read_resource_hash(hash),
+        )
         .with_context(|| format!("failed to read archive resource {}", job.resource))?;
     let mut input = NamedTempFile::new()
         .with_context(|| format!("failed to create temporary input for {}", job.resource))?;
@@ -895,7 +996,7 @@ fn serialize_archive_resource(
     input
         .flush()
         .with_context(|| format!("failed to flush archive resource {}", job.resource))?;
-    let document = codec::decode_wkit_with_red_schema(input.path(), schema, kraken_path)
+    let document = codec::decode_wkit_with_red_schema(input.path(), schema)
         .with_context(|| format!("failed to serialize archive resource {}", job.resource))?;
     write_json_atomic(&job.output, &document)
         .with_context(|| format!("failed to write {}", job.output.display()))
@@ -928,6 +1029,21 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rust_compression_commands_parse_native_inputs() {
+        assert!(Cli::try_parse_from(["ghostline-red", "kraken-encode", "input", "output"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "ghostline-red",
+                "kraken-decode",
+                "input",
+                "output",
+                "--size",
+                "8"
+            ])
+            .is_ok()
+        );
+    }
     use super::*;
 
     #[test]
@@ -936,15 +1052,42 @@ mod tests {
             "ghostline-red",
             "mesh-export-batch",
             "jobs.json",
-            "--schema",
-            "schema.json",
-            "--archives-root",
-            "archives",
+            "--game",
+            "Cyberpunk 2077",
             "--report",
             "report.json",
             "--geometry-only",
         ]);
         assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn resource_commands_use_bundled_reflection_and_one_game_argument() {
+        for args in [
+            vec![
+                "ghostline-red",
+                "cr2w-serialize",
+                "input.ent",
+                "output.json",
+            ],
+            vec![
+                "ghostline-red",
+                "schema-generate",
+                "bundle.json",
+                "--game",
+                "Cyberpunk 2077",
+            ],
+            vec![
+                "ghostline-red",
+                "--game",
+                "Cyberpunk 2077",
+                "cr2w-serialize",
+                "input.ent",
+                "output.json",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
     }
 
     #[test]
@@ -956,7 +1099,7 @@ mod tests {
                 "jobs.json",
                 "--schema",
                 "schema.json",
-                "--archives-root",
+                "--game",
                 "archives",
                 "--report",
                 "report.json",
@@ -976,7 +1119,7 @@ mod tests {
                 "jobs.json",
                 "--schema",
                 "schema.json",
-                "--archives-root",
+                "--game",
                 "archives",
                 "--report",
                 "report.json"

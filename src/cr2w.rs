@@ -4,7 +4,7 @@ use crate::binary::ReadLeExt;
 use serde::Serialize;
 use std::{
     fs::File,
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, Cursor, Read, Seek, SeekFrom},
     path::Path,
 };
 use thiserror::Error;
@@ -116,6 +116,22 @@ pub struct Cr2wEmbedded {
 pub fn inspect(path: &Path) -> Result<Cr2wInspection, Cr2wError> {
     let mut reader = BufReader::new(File::open(path)?);
     let file_len = reader.get_ref().metadata()?.len();
+    inspect_reader(&mut reader, file_len)
+}
+
+/// Inspects CR2W tables directly from native resource bytes.
+///
+/// # Errors
+///
+/// Returns [`Cr2wError`] for truncated input, invalid magic or invalid tables.
+pub fn inspect_bytes(bytes: &[u8]) -> Result<Cr2wInspection, Cr2wError> {
+    inspect_reader(Cursor::new(bytes), bytes.len() as u64)
+}
+
+fn inspect_reader(
+    mut reader: impl Read + Seek,
+    file_len: u64,
+) -> Result<Cr2wInspection, Cr2wError> {
     let mut magic = [0_u8; 4];
     reader.read_exact(&mut magic)?;
     if magic != CR2W_MAGIC {

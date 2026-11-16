@@ -756,6 +756,28 @@ impl Reader<'_> {
             }
             "Float" => exact(json!(f32::from_bits(u32_at(self.bytes, start)?))),
             "Double" => exact(json!(f64::from_bits(u64_at(self.bytes, start)?))),
+            "curveData:Float" => {
+                let count = usize::try_from(u32_at(self.bytes, start)?)
+                    .map_err(|_| malformed(start, "curve count"))?;
+                let end = count
+                    .checked_mul(8)
+                    .and_then(|n| start.checked_add(6)?.checked_add(n))
+                    .filter(|end| *end <= limit)
+                    .ok_or_else(|| malformed(start, "curve bounds"))?;
+                let mut elements = Vec::with_capacity(count);
+                for index in 0..count {
+                    let cursor = start + 4 + index * 8;
+                    elements.push(json!({"Point":f32::from_bits(u32_at(self.bytes,cursor)?),"Value":f32::from_bits(u32_at(self.bytes,cursor+4)?)}));
+                }
+                let interpolation = crate::codec::interpolation_type(byte(self.bytes, end - 2)?)
+                    .ok_or_else(|| malformed(end - 2, "curve interpolation"))?;
+                let link = crate::codec::segment_link_type(byte(self.bytes, end - 1)?)
+                    .ok_or_else(|| malformed(end - 1, "curve link"))?;
+                Ok((
+                    json!({"InterpolationType":interpolation,"LinkType":link,"Elements":elements}),
+                    end,
+                ))
+            }
             "CName" => exact(storage_string(
                 "CName",
                 self.name(usize::from(u16_at(self.bytes, start)?), start)?,
@@ -1067,6 +1089,40 @@ impl<'a> Encoder<'a> {
             }
             "Float" => exact(json_f32(value, start)?.to_le_bytes().to_vec()),
             "Double" => exact(json_f64(value, start)?.to_le_bytes().to_vec()),
+            "curveData:Float" => {
+                let elements = value
+                    .get("Elements")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| malformed(start, "curve Elements"))?;
+                let mut output = u32::try_from(elements.len())
+                    .map_err(|_| malformed(start, "curve count"))?
+                    .to_le_bytes()
+                    .to_vec();
+                for element in elements {
+                    output.extend_from_slice(&json_f32(&element["Point"], start)?.to_le_bytes());
+                    output.extend_from_slice(&json_f32(&element["Value"], start)?.to_le_bytes());
+                }
+                let interpolation = value
+                    .get("InterpolationType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| malformed(start, "curve interpolation"))?;
+                let link = value
+                    .get("LinkType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| malformed(start, "curve link"))?;
+                output.push(
+                    (0..=4)
+                        .find(|v| crate::codec::interpolation_type(*v) == Some(interpolation))
+                        .ok_or_else(|| malformed(start, "curve interpolation"))?,
+                );
+                output.push(
+                    (0..=2)
+                        .find(|v| crate::codec::segment_link_type(*v) == Some(link))
+                        .ok_or_else(|| malformed(start, "curve link"))?,
+                );
+                let consumed = self.reader.read_value(red_type, start, limit)?.1;
+                Ok((output, consumed))
+            }
             "CName" => exact(
                 self.name_index(storage_value(value, start)?)?
                     .to_le_bytes()
@@ -1452,86 +1508,7 @@ impl<'a> Encoder<'a> {
         name: &str,
         start: usize,
     ) -> Result<(Vec<u8>, usize), PackageError> {
-        let values = value
-            .as_array()
-            .ok_or_else(|| malformed(start, "compiled effect array"))?;
-        let mut output = u32::try_from(values.len())
-            .map_err(|_| malformed(start, "compiled effect count"))?
-            .to_le_bytes()
-            .to_vec();
-        for value in values {
-            match name {
-                "placementTags" | "componentNames" => output.extend_from_slice(
-                    &self.name_index(storage_value(value, start)?)?.to_le_bytes(),
-                ),
-                "relativePositions" => {
-                    for key in ["X", "Y", "Z"] {
-                        output.extend_from_slice(
-                            &json_f32(
-                                value.get(key).ok_or_else(|| malformed(start, "Vector3"))?,
-                                start,
-                            )?
-                            .to_le_bytes(),
-                        );
-                    }
-                }
-                "relativeRotations" => {
-                    for key in ["i", "j", "k", "r"] {
-                        output.extend_from_slice(
-                            &json_f32(
-                                value
-                                    .get(key)
-                                    .ok_or_else(|| malformed(start, "Quaternion"))?,
-                                start,
-                            )?
-                            .to_le_bytes(),
-                        );
-                    }
-                }
-                "placementInfos" => {
-                    for key in [
-                        "placementTagIndex",
-                        "relativePositionIndex",
-                        "relativeRotationIndex",
-                        "flags",
-                    ] {
-                        output.push(
-                            u8::try_from(json_u64(
-                                value
-                                    .get(key)
-                                    .ok_or_else(|| malformed(start, "placement info"))?,
-                                start,
-                            )?)
-                            .map_err(|_| malformed(start, "placement info"))?,
-                        );
-                    }
-                }
-                "eventsSortedByRUID" => {
-                    for key in ["eventRUID", "placementIndexMask", "componentIndexMask"] {
-                        output.extend_from_slice(
-                            &json_string_u64(
-                                value
-                                    .get(key)
-                                    .ok_or_else(|| malformed(start, "effect event"))?,
-                                start,
-                            )?
-                            .to_le_bytes(),
-                        );
-                    }
-                    output.push(
-                        u8::try_from(json_u64(
-                            value
-                                .get("flags")
-                                .ok_or_else(|| malformed(start, "effect event flags"))?,
-                            start,
-                        )?)
-                        .map_err(|_| malformed(start, "effect event flags"))?,
-                    );
-                    output.extend_from_slice(&[0; 7]);
-                }
-                _ => return Err(unsupported(name)),
-            }
-        }
+        let output = encode_compiled_effect_field(value, name, |name| self.name_index(name))?;
         let template_end = self
             .reader
             .read_compiled_effect_property(name, start, self.template.len())
@@ -1539,6 +1516,96 @@ impl<'a> Encoder<'a> {
             .1;
         Ok((output, template_end))
     }
+}
+
+/// Encodes the packed fields used by compiled effect packages (format flag 2).
+pub(crate) fn encode_compiled_effect_field(
+    value: &Value,
+    name: &str,
+    mut name_index: impl FnMut(&str) -> Result<u16, PackageError>,
+) -> Result<Vec<u8>, PackageError> {
+    let start = 0;
+    let values = value
+        .as_array()
+        .ok_or_else(|| malformed(start, "compiled effect array"))?;
+    let mut output = u32::try_from(values.len())
+        .map_err(|_| malformed(start, "compiled effect count"))?
+        .to_le_bytes()
+        .to_vec();
+    for value in values {
+        match name {
+            "placementTags" | "componentNames" => {
+                output.extend_from_slice(&name_index(storage_value(value, start)?)?.to_le_bytes())
+            }
+            "relativePositions" => {
+                for key in ["X", "Y", "Z"] {
+                    output.extend_from_slice(
+                        &json_f32(
+                            value.get(key).ok_or_else(|| malformed(start, "Vector3"))?,
+                            start,
+                        )?
+                        .to_le_bytes(),
+                    );
+                }
+            }
+            "relativeRotations" => {
+                for key in ["i", "j", "k", "r"] {
+                    output.extend_from_slice(
+                        &json_f32(
+                            value
+                                .get(key)
+                                .ok_or_else(|| malformed(start, "Quaternion"))?,
+                            start,
+                        )?
+                        .to_le_bytes(),
+                    );
+                }
+            }
+            "placementInfos" => {
+                for key in [
+                    "placementTagIndex",
+                    "relativePositionIndex",
+                    "relativeRotationIndex",
+                    "flags",
+                ] {
+                    output.push(
+                        u8::try_from(json_u64(
+                            value
+                                .get(key)
+                                .ok_or_else(|| malformed(start, "placement info"))?,
+                            start,
+                        )?)
+                        .map_err(|_| malformed(start, "placement info"))?,
+                    );
+                }
+            }
+            "eventsSortedByRUID" => {
+                for key in ["eventRUID", "placementIndexMask", "componentIndexMask"] {
+                    output.extend_from_slice(
+                        &json_string_u64(
+                            value
+                                .get(key)
+                                .ok_or_else(|| malformed(start, "effect event"))?,
+                            start,
+                        )?
+                        .to_le_bytes(),
+                    );
+                }
+                output.push(
+                    u8::try_from(json_u64(
+                        value
+                            .get("flags")
+                            .ok_or_else(|| malformed(start, "effect event flags"))?,
+                        start,
+                    )?)
+                    .map_err(|_| malformed(start, "effect event flags"))?,
+                );
+                output.extend_from_slice(&[0; 7]);
+            }
+            _ => return Err(unsupported(name)),
+        }
+    }
+    Ok(output)
 }
 
 #[expect(
@@ -1863,7 +1930,8 @@ fn is_variable_size(red_type: &str) -> bool {
     matches!(
         red_type,
         "String" | "CString" | "NodeRef" | "LocalizationString" | "DataBuffer" | "SharedDataBuffer"
-    ) || red_type.starts_with("array:")
+    ) || red_type.starts_with("curveData:")
+        || red_type.starts_with("array:")
         || red_type.starts_with("static:")
         || red_type.starts_with('[')
 }

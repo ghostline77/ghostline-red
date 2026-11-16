@@ -15,7 +15,6 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    ffi::OsStr,
     fs, io,
     path::Path,
 };
@@ -131,7 +130,6 @@ pub fn write_with_template(
     output_path: &Path,
     classes: &BTreeSet<String>,
     schema: &BTreeMap<String, schema::RedClass>,
-    kraken_path: &OsStr,
 ) -> Result<(), WriterError> {
     write_with_schema(
         json_path,
@@ -142,7 +140,6 @@ pub fn write_with_template(
         None,
         None,
         None,
-        kraken_path,
     )
 }
 
@@ -157,7 +154,6 @@ pub fn write_with_red_schema(
     template_path: &Path,
     output_path: &Path,
     schema: &RedSchema,
-    kraken_path: &OsStr,
 ) -> Result<(), WriterError> {
     let classes = schema.class_names();
     write_with_schema(
@@ -169,7 +165,6 @@ pub fn write_with_red_schema(
         Some(&schema.enums),
         Some(&schema.bitfields),
         Some(schema),
-        kraken_path,
     )
 }
 
@@ -187,7 +182,6 @@ fn write_with_schema(
     enums: Option<&BTreeSet<String>>,
     bitfields: Option<&BTreeSet<String>>,
     red_schema: Option<&RedSchema>,
-    kraken_path: &OsStr,
 ) -> Result<(), WriterError> {
     let document = read_json(json_path)?;
     let root = document
@@ -217,11 +211,9 @@ fn write_with_schema(
     }
     let template = fs::read(template_path)?;
     collect_buffer_overrides(&document, &mut buffer_overrides)?;
-    remap_buffer_overrides(&mut buffer_overrides, &file, &template, kraken_path)?;
+    remap_buffer_overrides(&mut buffer_overrides, &file, &template)?;
     let redpackage_ordinals = red_schema
-        .and_then(|schema| {
-            codec::decode_wkit_with_red_schema(template_path, schema, kraken_path).ok()
-        })
+        .and_then(|schema| codec::decode_wkit_with_red_schema(template_path, schema).ok())
         .map_or_else(HashMap::new, |template_document| {
             redpackage_ordinal_map(&document, &template_document)
         });
@@ -229,7 +221,6 @@ fn write_with_schema(
         file: &file,
         template: &template,
         classes,
-        kraken_path,
         ordinals: &redpackage_ordinals,
     };
     let mut claimed_redpackages = HashSet::new();
@@ -440,7 +431,7 @@ fn write_with_schema(
         let (bytes, memory_size) = if let Some(replacement) = buffer_overrides.get(&index) {
             if replacement.stored {
                 (replacement.bytes.clone(), replacement.memory_size)
-            } else if buffer_matches(stored, &replacement.bytes, kraken_path)? {
+            } else if buffer_matches(stored, &replacement.bytes)? {
                 (stored.to_vec(), buffer.memory_size)
             } else {
                 (
@@ -488,6 +479,24 @@ impl<'a> Encoder<'a> {
         schema: &'a RedSchema,
         package: bool,
     ) -> Self {
+        Self::from_types(
+            file,
+            classes,
+            &schema.classes,
+            Some(&schema.enums),
+            Some(&schema.bitfields),
+            package,
+        )
+    }
+
+    fn from_types(
+        file: &'a Cr2wInspection,
+        classes: &'a BTreeSet<String>,
+        schema: &'a BTreeMap<String, schema::RedClass>,
+        enums: Option<&'a BTreeSet<String>>,
+        bitfields: Option<&'a BTreeSet<String>>,
+        package: bool,
+    ) -> Self {
         Self {
             template: &[],
             file,
@@ -502,9 +511,9 @@ impl<'a> Encoder<'a> {
             candidate_handles: RefCell::new(HashSet::new()),
             discovering_handles: Cell::new(false),
             classes,
-            schema: &schema.classes,
-            enums: Some(&schema.enums),
-            bitfields: Some(&schema.bitfields),
+            schema,
+            enums,
+            bitfields,
             document_chunks: RefCell::new(vec![]),
             created_buffers: RefCell::new(vec![]),
             created_buffer_ids: RefCell::new(HashMap::new()),
@@ -564,7 +573,10 @@ impl<'a> Encoder<'a> {
                     self.discover_class_handles(data)?;
                 }
             }
-        } else if let Some(inner) = t.strip_prefix("array:") {
+        } else if let Some(inner) = t.strip_prefix("array:").or_else(|| {
+            t.strip_prefix("static:")
+                .and_then(|value| value.split_once(',').map(|(_, inner)| inner))
+        }) {
             if value.is_null() {
                 return Ok(());
             }
@@ -603,7 +615,10 @@ impl<'a> Encoder<'a> {
             .or_else(|| v.get("Data"))
             .and_then(Value::as_array)
         {
-            encode_world_node_buffer(entries)?
+            encode_world_node_buffer(
+                entries,
+                v.get("Version").and_then(Value::as_u64).unwrap_or(62),
+            )?
         } else if let Some(bytes) = v.get("Bytes").and_then(Value::as_str) {
             STANDARD.decode(bytes)?
         } else if id.is_none() {
@@ -613,7 +628,8 @@ impl<'a> Encoder<'a> {
         };
         let index = self.created_buffers.borrow().len();
         self.created_buffers.borrow_mut().push((
-            v.get("Flags").and_then(Value::as_u64).unwrap_or(0) as u32,
+            u32::try_from(v.get("Flags").and_then(Value::as_u64).unwrap_or(0))
+                .map_err(|_| unsupported("buffer flags range"))?,
             bytes,
         ));
         if let Some(id) = id {
@@ -624,10 +640,16 @@ impl<'a> Encoder<'a> {
         Ok(Some(index))
     }
     fn encode_sector_appendix(&self, v: &Value) -> Result<Vec<u8>, WriterError> {
+        let mut buffer = v
+            .get("nodeData")
+            .ok_or_else(|| unsupported("nodeData"))?
+            .clone();
+        buffer["Version"] = v.get("version").cloned().unwrap_or(serde_json::json!(62));
         let index = self
-            .encode_buffer(v.get("nodeData").ok_or_else(|| unsupported("nodeData"))?)?
+            .encode_buffer(&buffer)?
             .ok_or_else(|| unsupported("nodeData buffer"))?;
-        let mut out = (v.get("version").and_then(Value::as_i64).unwrap_or(1) as i32)
+        let mut out = i32::try_from(v.get("version").and_then(Value::as_i64).unwrap_or(1))
+            .map_err(|_| unsupported("sector version range"))?
             .to_le_bytes()
             .to_vec();
         out.extend(0_u32.to_le_bytes());
@@ -645,19 +667,36 @@ impl<'a> Encoder<'a> {
         let variants = array(v, "variantIndices")?;
         write_positive_vlq(&mut out, u32n(variants.len())?);
         for n in variants {
-            out.extend((json_i64(n)? as i32).to_le_bytes());
+            out.extend(
+                i32::try_from(json_i64(n)?)
+                    .map_err(|_| unsupported("sector variant index range"))?
+                    .to_le_bytes(),
+            );
         }
         out.extend(
-            (v.get("persistentNodeIndex")
-                .and_then(Value::as_i64)
-                .unwrap_or(-1) as i32)
-                .to_le_bytes(),
+            i32::try_from(
+                v.get("persistentNodeIndex")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1),
+            )
+            .map_err(|_| unsupported("persistent node index range"))?
+            .to_le_bytes(),
         );
         let size = u32n(out.len() - 4)?;
         write_u32_at(&mut out, 4, size)?;
         Ok(out)
     }
     fn encode_package(&self, v: &Value) -> Result<Vec<u8>, WriterError> {
+        let imports_as_hash = self
+            .document_chunks
+            .borrow()
+            .first()
+            .is_some_and(|c| kind(c).ok() == Some("appearanceAppearanceResource"))
+            || self
+                .file
+                .exports
+                .first()
+                .is_some_and(|e| e.class_name == "appearanceAppearanceResource");
         let schema = RedSchema {
             classes: self.schema.clone(),
             enums: self.enums.cloned().unwrap_or_default(),
@@ -680,12 +719,27 @@ impl<'a> Encoder<'a> {
         }
         let names = e.new_names.borrow();
         let imports = e.new_imports.borrow();
-        let mut out = vec![4, 0, 7, 0];
+        fn contains_effect(value: &Value) -> bool {
+            match value {
+                Value::Object(fields) => {
+                    fields.get("$type").and_then(Value::as_str) == Some("worldCompiledEffectInfo")
+                        || fields.values().any(contains_effect)
+                }
+                Value::Array(values) => values.iter().any(contains_effect),
+                _ => false,
+            }
+        }
+        let compiled_effects = e.document_chunks.borrow().iter().any(contains_effect);
+        let mut out = vec![4, if compiled_effects { 2 } else { 0 }, 7, 0];
         out.extend(u32n(array(v, "Chunks")?.len())?.to_le_bytes());
         out.resize(32, 0);
-        out.extend((v.get("CruidIndex").and_then(Value::as_i64).unwrap_or(0) as i16).to_le_bytes());
+        out.extend(
+            i16::try_from(v.get("CruidIndex").and_then(Value::as_i64).unwrap_or(0))
+                .map_err(|_| unsupported("package CRUID index range"))?
+                .to_le_bytes(),
+        );
         let cruids = v.get("CruidDict").and_then(Value::as_object);
-        let count = cruids.map_or(0, |d| d.len());
+        let count = cruids.map_or(0, serde_json::Map::len);
         out.extend(
             u16::try_from(count)
                 .map_err(|_| WriterError::TooLarge)?
@@ -707,12 +761,19 @@ impl<'a> Encoder<'a> {
         out.resize(start + imports.len() * 4, 0);
         sections.push(u32n(out.len() - base)?);
         for (i, import) in imports.iter().enumerate() {
-            let bytes = import.depot_path.as_bytes();
+            let bytes = if imports_as_hash {
+                crate::assets::ResourceKey::parse(&import.depot_path)
+                    .native_hash()
+                    .to_le_bytes()
+                    .to_vec()
+            } else {
+                import.depot_path.as_bytes().to_vec()
+            };
             let descriptor = u32n(out.len() - base)?
                 | (u32n(bytes.len())? << 23)
                 | (u32::from(import.flags & 5 != 0) << 31);
             write_u32_at(&mut out, start + i * 4, descriptor)?;
-            out.extend(bytes);
+            out.extend(&bytes);
         }
         sections.push(u32n(out.len() - base)?);
         let start = out.len();
@@ -741,7 +802,7 @@ impl<'a> Encoder<'a> {
             &out,
             self.classes,
             PackageSettings {
-                imports_as_hash: false,
+                imports_as_hash,
                 handle_id_base: 0,
                 enums: self.enums,
                 bitfields: self.bitfields,
@@ -750,12 +811,43 @@ impl<'a> Encoder<'a> {
         Ok(out)
     }
     fn encode_container(&self, document: &Value) -> Result<Vec<u8>, WriterError> {
-        if document
+        let mut embedded_exports = Vec::new();
+        let mut embedded_names = HashSet::new();
+        if let Some(files) = document
             .pointer("/Data/EmbeddedFiles")
             .and_then(Value::as_array)
-            .is_some_and(|a| !a.is_empty())
         {
-            return Err(unsupported("embedded files"));
+            for embedded in files {
+                let path = embedded
+                    .get("FileName")
+                    .and_then(|v| v.get("$value"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| unsupported("embedded file name"))?;
+                if !embedded_names.insert(path) {
+                    return Err(unsupported("duplicate embedded file identity"));
+                }
+                let content = embedded
+                    .get("Content")
+                    .ok_or_else(|| unsupported("embedded content"))?;
+                let resource_type = kind(content)?;
+                let reference = serde_json::json!({"DepotPath":{"$type":"ResourcePath","$storage":"string","$value":path},"Flags":"Embedded"});
+                let encoded =
+                    self.encode_new_value(&reference, &format!("rRef:{resource_type}"))?;
+                let import_index = u32::from(u16::from_le_bytes(
+                    encoded
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| unsupported("embedded import index"))?,
+                ));
+                let chunk_index = u32n(self.document_chunks.borrow().len())?;
+                self.document_chunks.borrow_mut().push(content.clone());
+                self.discover_class_handles(content)?;
+                embedded_exports.push((
+                    import_index,
+                    chunk_index,
+                    crate::archive::depot_path_hash(path),
+                ));
+            }
         }
         let mut chunks = vec![];
         let mut types = vec![];
@@ -781,11 +873,20 @@ impl<'a> Encoder<'a> {
         tables[3].resize(16, 0);
         tables[4].resize(chunks.len() * 24, 0);
         tables[5].resize(self.created_buffers.borrow().len() * 24, 0);
+        for (import_index, chunk_index, path_hash) in &embedded_exports {
+            tables[6].extend(import_index.to_le_bytes());
+            tables[6].extend(chunk_index.to_le_bytes());
+            tables[6].extend(path_hash.to_le_bytes());
+        }
         let mut out = vec![0; 160];
         out[..4].copy_from_slice(b"CR2W");
         write_u32_at(&mut out, 4, 195)?;
         // This header value is the CR2W table count, not the export count.
-        write_u32_at(&mut out, 36, 6)?;
+        write_u32_at(
+            &mut out,
+            36,
+            if embedded_exports.is_empty() { 6 } else { 7 },
+        )?;
         let mut offsets = [0; 10];
         let sizes = [1, 8, 8, 16, 24, 24, 16, 1, 1, 1];
         for i in 0..10 {
@@ -988,6 +1089,14 @@ impl Encoder<'_> {
             output.extend_from_slice(&self.encode_device_data_appendix(object)?);
             return Ok((output, template_end));
         }
+        if red_type == "CMaterialInstance" && object.get("values").is_some() {
+            output.extend(self.encode_material_values(value)?);
+            return Ok((output, template_end));
+        }
+        if red_type == "C2dArray" && object.get("headers").is_some() {
+            output.extend(encode_table_appendix(value)?);
+            return Ok((output, template_end));
+        }
         if matches!(red_type, "worldStreamingWorld" | "CMaterialInstance") {
             // Typed reverse appendix codecs are connected separately; until
             // then the audited template bytes remain authoritative.
@@ -1008,6 +1117,22 @@ impl Encoder<'_> {
     }
 
     fn encode_new_value(&self, v: &Value, t: &str) -> Result<Vec<u8>, WriterError> {
+        if let Some(spec) = t.strip_prefix("static:") {
+            let (capacity, inner) = spec
+                .split_once(',')
+                .ok_or_else(|| unsupported("static array type"))?;
+            let capacity = capacity
+                .parse::<usize>()
+                .map_err(|_| unsupported("static array capacity"))?;
+            let elements = v.get("Elements").unwrap_or(v);
+            if elements
+                .as_array()
+                .is_none_or(|array| array.len() > capacity)
+            {
+                return Err(unsupported("static array capacity"));
+            }
+            return self.encode_new_value(elements, &format!("array:{inner}"));
+        }
         if self.package && t == "LocalizationString" {
             let mut bytes = json_string_u64(
                 v.get("unk1")
@@ -1084,42 +1209,10 @@ impl Encoder<'_> {
             t,
             "DataBuffer" | "serializationDeferredDataBuffer" | "SharedDataBuffer"
         ) {
-            if self.package || t == "SharedDataBuffer" {
-                let bytes =
-                    STANDARD.decode(v.get("Bytes").and_then(Value::as_str).unwrap_or(""))?;
-                let mut out = u32n(bytes.len())?.to_le_bytes().to_vec();
-                out.extend(bytes);
-                return Ok(out);
-            }
-            let Some(index) = self.encode_buffer(v)? else {
-                return Ok(if t == "DataBuffer" {
-                    0_u32.to_le_bytes().to_vec()
-                } else {
-                    0_u16.to_le_bytes().to_vec()
-                });
-            };
-            return Ok(if t == "DataBuffer" {
-                (u32n(index)? + 0x8000_0001).to_le_bytes().to_vec()
-            } else {
-                u16::try_from(index + 1)
-                    .map_err(|_| WriterError::TooLarge)?
-                    .to_le_bytes()
-                    .to_vec()
-            });
+            return self.encode_new_buffer_value(v, t);
         }
         if self.package && matches!(t, "String" | "NodeRef") {
-            let text = if t == "String" {
-                v.as_str()
-            } else {
-                Some(node_ref_value(v)?)
-            }
-            .ok_or_else(|| unsupported("package string"))?;
-            let mut out = u16::try_from(text.len())
-                .map_err(|_| WriterError::TooLarge)?
-                .to_le_bytes()
-                .to_vec();
-            out.extend(text.as_bytes());
-            return Ok(out);
+            return Self::encode_package_string(v, t);
         }
         if t.starts_with("rRef:") || t.starts_with("raRef:") {
             let encoded = self.encode_value(v, t, 0, 0, &mut HashMap::new())?.0;
@@ -1132,10 +1225,73 @@ impl Encoder<'_> {
             }
             return Ok(encoded);
         }
-        if self.classes.contains(t) && !matches!(t, "gamedataLocKeyWrapper" | "LocalizationString")
+        if t == "Variant"
+            || (self.classes.contains(t)
+                && !matches!(t, "gamedataLocKeyWrapper" | "LocalizationString"))
         {
             return self.encode_new_class(v, t);
         }
+        self.encode_new_scalar(v, t)
+    }
+
+    fn encode_package_string(v: &Value, t: &str) -> Result<Vec<u8>, WriterError> {
+        let text = if t == "String" {
+            v.as_str()
+        } else {
+            Some(node_ref_value(v)?)
+        }
+        .ok_or_else(|| unsupported("package string"))?;
+        let mut out = u16::try_from(text.len())
+            .map_err(|_| WriterError::TooLarge)?
+            .to_le_bytes()
+            .to_vec();
+        out.extend(text.as_bytes());
+        Ok(out)
+    }
+
+    fn encode_new_buffer_value(&self, v: &Value, t: &str) -> Result<Vec<u8>, WriterError> {
+        if self.package || t == "SharedDataBuffer" {
+            let bytes = if let Some(document) = v.pointer("/Data/File") {
+                let file = empty_file();
+                let encoder = Encoder::from_types(
+                    &file,
+                    self.classes,
+                    self.schema,
+                    self.enums,
+                    self.bitfields,
+                    false,
+                );
+                let root = document
+                    .get("RootChunk")
+                    .ok_or_else(|| unsupported("embedded CR2W root"))?;
+                encoder.document_chunks.borrow_mut().push(root.clone());
+                encoder.discover_class_handles(root)?;
+                encoder.encode_container(&serde_json::json!({"Data":document}))?
+            } else {
+                STANDARD.decode(v.get("Bytes").and_then(Value::as_str).unwrap_or(""))?
+            };
+            let mut out = u32n(bytes.len())?.to_le_bytes().to_vec();
+            out.extend(bytes);
+            return Ok(out);
+        }
+        let Some(index) = self.encode_buffer(v)? else {
+            return Ok(if t == "DataBuffer" {
+                0_u32.to_le_bytes().to_vec()
+            } else {
+                0_u16.to_le_bytes().to_vec()
+            });
+        };
+        Ok(if t == "DataBuffer" {
+            (u32n(index)? + 0x8000_0001).to_le_bytes().to_vec()
+        } else {
+            u16::try_from(index + 1)
+                .map_err(|_| WriterError::TooLarge)?
+                .to_le_bytes()
+                .to_vec()
+        })
+    }
+
+    fn encode_new_scalar(&self, v: &Value, t: &str) -> Result<Vec<u8>, WriterError> {
         match t {
             "Bool" => Ok(vec![u8::from(json_bool(v)?)]),
             "Int8" => Ok(i8::try_from(json_i64(v)?)
@@ -1200,6 +1356,27 @@ impl Encoder<'_> {
         }
     }
 
+    fn encode_material_values(&self, value: &Value) -> Result<Vec<u8>, WriterError> {
+        let values = array(value, "values")?;
+        let mut output = u32n(values.len())?.to_le_bytes().to_vec();
+        for value in values {
+            let t = kind(value)?;
+            let fields = value
+                .as_object()
+                .ok_or_else(|| unsupported("material parameter object"))?;
+            let (name, value) = fields
+                .iter()
+                .find(|(name, _)| !name.starts_with('$'))
+                .ok_or_else(|| unsupported("material parameter value"))?;
+            let bytes = self.encode_new_value(value, t)?;
+            output.extend(u32n(bytes.len() + 8)?.to_le_bytes());
+            output.extend(self.name_index(name)?.to_le_bytes());
+            output.extend(self.name_index(t)?.to_le_bytes());
+            output.extend(bytes);
+        }
+        Ok(output)
+    }
+
     fn encode_new_class(&self, value: &Value, red_type: &str) -> Result<Vec<u8>, WriterError> {
         let mut typed = value.clone();
         if typed.get("$type").is_none() {
@@ -1210,7 +1387,17 @@ impl Encoder<'_> {
         if t == "AreaShapeOutline" && !self.package {
             return area_shape_outline_buffer(value);
         }
-        if is_opaque_custom_data(t) {
+        if t == "Variant" && value.get("value_type").is_some() {
+            let inner = value["value_type"]
+                .as_str()
+                .ok_or_else(|| unsupported("Variant.value_type"))?;
+            let payload = self.encode_new_value(&value["value"], inner)?;
+            let mut out = self.name_index(inner)?.to_le_bytes().to_vec();
+            out.extend(u32n(payload.len() + 4)?.to_le_bytes());
+            out.extend(payload);
+            return Ok(out);
+        }
+        if is_opaque_custom_data(t) && !(self.package && t == "worldCompiledEffectInfo") {
             return STANDARD
                 .decode(
                     value
@@ -1225,12 +1412,22 @@ impl Encoder<'_> {
             if v.is_null() && self.classes.contains(&t) {
                 continue;
             }
-            if let Some(elements) = v.get("Elements").and_then(Value::as_array) {
-                if let Some(inner) = t.strip_prefix("array:") {
-                    t = format!("[{}]{inner}", elements.len());
-                }
+            if let Some(elements) = v.get("Elements").and_then(Value::as_array)
+                && let Some(inner) = t.strip_prefix("array:")
+            {
+                t = format!("[{}]{inner}", elements.len());
             }
-            let payload = self.encode_new_value(&v, &t).map_err(|e| {
+            let payload = if self.package && red_type == "worldCompiledEffectInfo" {
+                redpackage::encode_compiled_effect_field(&v, &name, |name| {
+                    self.name_index(name)
+                        .map_err(|e| PackageError::Unsupported(e.to_string()))
+                })?
+            } else {
+                self.encode_new_value(&v, &t).map_err(|e| {
+                    unsupported(format!("{}.{}: {e}", kind(value).unwrap_or("?"), name))
+                })?
+            };
+            let payload = Ok::<_, WriterError>(payload).map_err(|e| {
                 unsupported(format!("{}.{}: {e}", kind(value).unwrap_or("?"), name))
             })?;
             fields.push((self.name_index(&name)?, self.name_index(&t)?, payload));
@@ -1257,10 +1454,24 @@ impl Encoder<'_> {
                 out.extend(encode_property(n, t, &bytes)?);
             }
             out.extend(0_u16.to_le_bytes());
+            if t == "CMaterialInstance" {
+                out.extend(self.encode_material_values(value)?);
+            }
             if t == "worldStreamingSector" {
                 out.extend(self.encode_sector_appendix(value)?);
             }
-            if let Some(tail) = value.get("$rawTail").and_then(Value::as_str) {
+            if t == "gameDeviceResourceData" {
+                out.extend(
+                    self.encode_device_data_appendix(
+                        value
+                            .as_object()
+                            .ok_or_else(|| unsupported("device data object"))?,
+                    )?,
+                );
+            }
+            if t == "C2dArray" && value.get("headers").is_some() {
+                out.extend(encode_table_appendix(value)?);
+            } else if let Some(tail) = value.get("$rawTail").and_then(Value::as_str) {
                 out.extend(STANDARD.decode(tail)?);
             }
             if t == "scnAnimName" && value.get("$rawTail").is_none() && value.get("unk1").is_some()
@@ -2424,7 +2635,14 @@ fn class_property<'a>(
         if let Some(property) = class.properties.get(property) {
             return Some(property);
         }
-        current = class.base.as_deref();
+        // The exported schema records the appendix interface as this class's
+        // base, hiding its native CResource properties (including cookingPlatform).
+        current = if name == "worldStreamingSector" && class.base.as_deref() == Some("IRedAppendix")
+        {
+            Some("CResource")
+        } else {
+            class.base.as_deref()
+        };
     }
     None
 }
@@ -2448,6 +2666,7 @@ fn red_type_from_cs(cs_type: &str) -> Option<String> {
         "CDouble" => "Double",
         "CName" => "CName",
         "CColor" => "Color",
+        "CVariant" => "Variant",
         "CString" => "String",
         "NodeRef" => "NodeRef",
         "TweakDBID" => "TweakDBID",
@@ -2959,6 +3178,7 @@ fn collect_buffer_overrides(
                                 .get("Data")
                                 .and_then(Value::as_array)
                                 .ok_or_else(|| unsupported("worldNodeDataBuffer.Data"))?,
+                            object.get("Version").and_then(Value::as_u64).unwrap_or(62),
                         )?,
                         stored: false,
                         memory_size: 0,
@@ -3003,14 +3223,14 @@ fn remap_buffer_overrides(
     overrides: &mut HashMap<usize, BufferOverride>,
     file: &Cr2wInspection,
     template: &[u8],
-    kraken_path: &OsStr,
 ) -> Result<(), WriterError> {
     let mut pending = std::mem::take(overrides).into_iter().collect::<Vec<_>>();
     pending.sort_by_key(|(index, _)| *index);
     let uncompressed = (0..file.buffers.len())
-        .map(|index| uncompressed_template_buffer(file, template, index, kraken_path).ok())
+        .map(|index| uncompressed_template_buffer(file, template, index).ok())
         .collect::<Vec<_>>();
     let mut claimed = HashSet::new();
+    let mut changed = Vec::new();
     for (requested, replacement) in pending {
         let mut candidates = Vec::new();
         for (index, buffer) in file.buffers.iter().enumerate() {
@@ -3041,10 +3261,22 @@ fn remap_buffer_overrides(
                     .find(|index| !claimed.contains(index))
             })
         else {
+            changed.push((requested, replacement));
             continue;
         };
         claimed.insert(target);
         overrides.insert(target, replacement);
+    }
+    // Unchanged buffers can be identified by content even when document IDs
+    // differ. Edited buffers cannot match the old bytes: preserve their explicit
+    // native index after unchanged buffers have claimed their destinations.
+    for (requested, replacement) in changed {
+        if requested >= file.buffers.len() || !claimed.insert(requested) {
+            return Err(unsupported(format!(
+                "edited buffer {requested} has no unambiguous template destination"
+            )));
+        }
+        overrides.insert(requested, replacement);
     }
     Ok(())
 }
@@ -3099,7 +3331,6 @@ struct RedPackageContext<'a> {
     file: &'a Cr2wInspection,
     template: &'a [u8],
     classes: &'a BTreeSet<String>,
-    kraken_path: &'a OsStr,
     ordinals: &'a HashMap<usize, usize>,
 }
 
@@ -3184,12 +3415,7 @@ fn resolve_redpackage_template_buffer(
     let expected_roots = redpackage_root_types(data);
     let mut packages = Vec::new();
     for index in 0..context.file.buffers.len() {
-        let Ok(bytes) = uncompressed_template_buffer(
-            context.file,
-            context.template,
-            index,
-            context.kraken_path,
-        ) else {
+        let Ok(bytes) = uncompressed_template_buffer(context.file, context.template, index) else {
             continue;
         };
         if redpackage::imports_are_hashed(&bytes).is_err() {
@@ -3360,7 +3586,6 @@ fn uncompressed_template_buffer(
     file: &Cr2wInspection,
     template: &[u8],
     index: usize,
-    kraken_path: &OsStr,
 ) -> Result<Vec<u8>, WriterError> {
     let buffer = file
         .buffers
@@ -3383,12 +3608,11 @@ fn uncompressed_template_buffer(
             .try_into()
             .map_err(|_| unsupported("RedPackage KARK header"))?,
     );
-    Ok(archive::decompress_payload_isolated(
+    Ok(archive::decompress_payload(
         stored
             .get(8..)
             .ok_or_else(|| unsupported("RedPackage KARK payload"))?,
         usize::try_from(declared).map_err(|_| WriterError::TooLarge)?,
-        kraken_path,
     )?)
 }
 
@@ -3396,7 +3620,7 @@ fn uncompressed_template_buffer(
     clippy::cast_possible_truncation,
     reason = "world node vectors are explicitly stored as IEEE-754 binary32"
 )]
-fn encode_world_node_buffer(entries: &[Value]) -> Result<Vec<u8>, WriterError> {
+fn encode_world_node_buffer(entries: &[Value], version: u64) -> Result<Vec<u8>, WriterError> {
     let mut output = Vec::with_capacity(entries.len() * 144);
     for entry in entries {
         let vector = |name: &str, component: &str| {
@@ -3453,6 +3677,25 @@ fn encode_world_node_buffer(entries: &[Value]) -> Result<Vec<u8>, WriterError> {
                 })
                 .to_le_bytes(),
         );
+        if version >= 68 {
+            let bounded = |field: &str, max: u64| -> Result<u64, WriterError> {
+                let value = entry
+                    .get(field)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| unsupported(format!("world node {field}")))?;
+                if value > max {
+                    return Err(unsupported(format!(
+                        "world node {field} exceeds native range"
+                    )));
+                }
+                Ok(value)
+            };
+            let bits = bounded("NodeIndex", 0x7_ffff)?
+                | (bounded("NodeFlags", 0x1f_ffff)? << 19)
+                | (bounded("StreamingPriority", 0xff)? << 40)
+                | (bounded("TimeOfDayMask", 0xffff)? << 48);
+            output.extend_from_slice(&bits.to_le_bytes());
+        }
         for field in ["MaxStreamingDistance", "UkFloat1"] {
             #[allow(
                 clippy::cast_possible_truncation,
@@ -3464,6 +3707,36 @@ fn encode_world_node_buffer(entries: &[Value]) -> Result<Vec<u8>, WriterError> {
                 .ok_or_else(|| unsupported(format!("world node {field}")))?
                 as f32;
             output.extend_from_slice(&value.to_le_bytes());
+        }
+        if version >= 68 {
+            let instance = entry
+                .get("InstanceIndex")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| unsupported("world node InstanceIndex"))?;
+            let group = entry
+                .get("DataGroup")
+                .and_then(Value::as_u64)
+                .and_then(|v| u8::try_from(v).ok())
+                .ok_or_else(|| unsupported("world node DataGroup"))?;
+            output.extend_from_slice(&instance.to_le_bytes());
+            output.push(group);
+            if let Some(padding) = entry.get("Padding") {
+                let padding = padding
+                    .as_array()
+                    .filter(|v| v.len() == 11)
+                    .ok_or_else(|| unsupported("world node Padding must contain eleven bytes"))?;
+                for byte in padding {
+                    output.push(
+                        byte.as_u64()
+                            .and_then(|v| u8::try_from(v).ok())
+                            .ok_or_else(|| unsupported("world node Padding byte"))?,
+                    );
+                }
+            } else {
+                output.extend_from_slice(&[0; 11]);
+            }
+            continue;
         }
         for field in ["NodeIndex", "Uk10", "Uk11", "Uk12"] {
             let value = entry
@@ -3533,11 +3806,7 @@ fn node_ref_hash_without_aliases(value: &str) -> u64 {
     hash
 }
 
-fn buffer_matches(
-    stored: &[u8],
-    replacement: &[u8],
-    kraken_path: &OsStr,
-) -> Result<bool, WriterError> {
+fn buffer_matches(stored: &[u8], replacement: &[u8]) -> Result<bool, WriterError> {
     if stored.get(..4) != Some(b"KARK") {
         return Ok(stored == replacement);
     }
@@ -3548,10 +3817,9 @@ fn buffer_matches(
             .try_into()
             .map_err(|_| unsupported("KARK header"))?,
     );
-    match archive::decompress_payload_isolated(
+    match archive::decompress_payload(
         &stored[8..],
         usize::try_from(declared).map_err(|_| WriterError::TooLarge)?,
-        kraken_path,
     ) {
         Ok(bytes) => Ok(bytes == replacement),
         // Preserve the template if the native decoder cannot compare it.
@@ -3609,6 +3877,32 @@ fn encode_string(value: &str) -> Result<Vec<u8>, WriterError> {
     Ok(output)
 }
 
+fn encode_table_appendix(value: &Value) -> Result<Vec<u8>, WriterError> {
+    let mut output = Vec::new();
+    let strings = |out: &mut Vec<u8>, values: &[Value]| -> Result<(), WriterError> {
+        write_positive_vlq(out, u32n(values.len())?);
+        for value in values {
+            out.extend(encode_string(
+                value
+                    .as_str()
+                    .ok_or_else(|| unsupported("table cell must be a string"))?,
+            )?);
+        }
+        Ok(())
+    };
+    strings(&mut output, array(value, "headers")?)?;
+    let rows = array(value, "data")?;
+    write_positive_vlq(&mut output, u32n(rows.len())?);
+    for row in rows {
+        strings(
+            &mut output,
+            row.as_array()
+                .ok_or_else(|| unsupported("table row must be an array"))?,
+        )?;
+    }
+    Ok(output)
+}
+
 fn encode_string_with_template(value: &str, template: &[u8]) -> Result<Vec<u8>, WriterError> {
     if value.is_empty() && matches!(template, [0 | 0x80]) {
         return Ok(template.to_vec());
@@ -3663,7 +3957,6 @@ fn is_opaque_custom_data(red_type: &str) -> bool {
         red_type,
         "Variant"
             | "AITrafficWorkspotCompiled"
-            | "animAnimationBufferCompressed"
             | "gameCompiledSmartObjectData"
             | "gameSmartObjectAnimationDatabase"
             | "worldCompiledEffectInfo"
@@ -3848,8 +4141,85 @@ fn normalize_wolvenkit_enum_name(value: &str) -> &str {
     }
 }
 
+/// Creates a CR2W resource directly from JSON and reflection metadata.
+///
+/// # Errors
+/// Returns an error for invalid references, unsupported custom data or I/O.
+pub fn write(input: &Path, output: &Path, schema: &RedSchema) -> Result<(), WriterError> {
+    let document = read_json(input)?;
+    let file = empty_file();
+    let classes = schema.class_names();
+    let encoder = Encoder::new_document(&file, &classes, schema, false);
+    let root = document
+        .pointer("/Data/RootChunk")
+        .ok_or_else(|| unsupported("missing root"))?;
+    encoder.document_chunks.borrow_mut().push(root.clone());
+    encoder.discover_class_handles(root)?;
+    let bytes = encoder.encode_container(&document)?;
+    fs::write(output, bytes)?;
+    Ok(())
+}
+
+fn empty_file() -> Cr2wInspection {
+    Cr2wInspection {
+        header: cr2w::Cr2wHeader {
+            version: 195,
+            flags: 0,
+            timestamp: 0,
+            build_version: 0,
+            objects_end: 0,
+            buffers_end: 0,
+            crc32: 0,
+            chunk_count: 0,
+            tables: vec![],
+        },
+        strings: vec![],
+        names: vec![],
+        imports: vec![],
+        exports: vec![],
+        buffers: vec![],
+        embedded: vec![],
+    }
+}
+
+fn kind(value: &Value) -> Result<&str, WriterError> {
+    value
+        .get("$type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| unsupported("missing class type"))
+}
+fn array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], WriterError> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| unsupported(format!("missing array {key}")))
+}
+fn u32n(value: usize) -> Result<u32, WriterError> {
+    u32::try_from(value).map_err(|_| WriterError::TooLarge)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writer_rejects_out_of_range_buffer_sector_and_package_fields() {
+        let file = super::empty_file();
+        let schema = crate::schema::RedSchema::default();
+        let classes = schema.class_names();
+        let encoder = super::Encoder::new_document(&file, &classes, &schema, false);
+        let flags = serde_json::json!({"Bytes":"", "Flags":u64::MAX});
+        assert!(encoder.encode_buffer(&flags).is_err());
+        let sector = serde_json::json!({"nodeData":{"Bytes":""}, "nodes":[], "nodeRefs":[], "variantIndices":[]});
+        for (field, value) in [("version", i64::MAX), ("persistentNodeIndex", i64::MIN)] {
+            let mut invalid = sector.clone();
+            invalid[field] = serde_json::json!(value);
+            assert!(encoder.encode_sector_appendix(&invalid).is_err(), "{field}");
+        }
+        let mut invalid = sector;
+        invalid["variantIndices"] = serde_json::json!([i64::MAX]);
+        assert!(encoder.encode_sector_appendix(&invalid).is_err());
+        let package = serde_json::json!({"Chunks":[], "CruidIndex":i64::MAX});
+        assert!(encoder.encode_package(&package).is_err());
+    }
     #[test]
     fn direct_write_roundtrips_package_enum_arrays() {
         let metadata = json!({
@@ -3870,7 +4240,7 @@ mod tests {
                     {"$type":"Operation","label":{"$type":"CName","$value":"second"},"flags":"Visible","mode":"Disable"}]}]}}}}});
         fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
         super::write(&input, &output, &schema).unwrap();
-        let decoded = codec::decode_wkit_with_red_schema(&output, &schema, OsStr::new("")).unwrap();
+        let decoded = codec::decode_wkit_with_red_schema(&output, &schema).unwrap();
         assert_eq!(
             decoded.pointer("/Data/RootChunk/compiledData/Data/Chunks/0/items/0/mode"),
             Some(&json!("Enable"))
@@ -3899,7 +4269,7 @@ mod tests {
         assert_eq!(inspection.exports.len(), 2);
         assert_eq!(inspection.header.chunk_count, 6);
         assert_eq!(inspection.header.tables[3].item_count, 1);
-        let decoded = codec::decode_wkit_with_red_schema(&output, &schema, OsStr::new("")).unwrap();
+        let decoded = codec::decode_wkit_with_red_schema(&output, &schema).unwrap();
         assert_eq!(
             decoded.pointer("/Data/RootChunk/enabled"),
             Some(&json!(true))
@@ -3908,6 +4278,27 @@ mod tests {
             decoded.pointer("/Data/RootChunk/children/0/Data/enabled"),
             Some(&json!(false))
         );
+    }
+
+    #[test]
+    fn variants_roundtrip_without_a_reflected_variant_class() {
+        let schema = super::RedSchema::from_slice(br#"{"Example":{"base":null,"properties":{"values":{"cs_type":"CArray<CVariant>","ordinal":0}}}}"#).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("variants.json");
+        let output = directory.path().join("variants.cr2w");
+        let authored = json!({"Data":{"RootChunk":{"$type":"Example","values":[
+            {"$type":"Variant","value_type":"Bool","value":true},
+            {"$type":"Variant","value_type":"Int32","value":-7}
+        ]}}});
+        fs::write(&input, serde_json::to_vec(&authored).unwrap()).unwrap();
+        super::write(&input, &output, &schema).unwrap();
+        let decoded = codec::decode_wkit_with_red_schema(&output, &schema).unwrap();
+        for index in 0..2 {
+            for field in ["value_type", "value"] {
+                let pointer = format!("/Data/RootChunk/values/{index}/{field}");
+                assert_eq!(decoded.pointer(&pointer), authored.pointer(&pointer));
+            }
+        }
     }
 
     #[test]
@@ -3953,9 +4344,7 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-        env,
-        ffi::OsStr,
-        fs,
+        env, fs,
         path::PathBuf,
     };
 
@@ -4165,7 +4554,7 @@ mod tests {
         stored.extend_from_slice(&u32::try_from(replacement.len()).unwrap().to_le_bytes());
         stored.extend_from_slice(&payload);
 
-        assert!(buffer_matches(&stored, replacement, OsStr::new("missing-kraken.dll")).unwrap());
+        assert!(buffer_matches(&stored, replacement).unwrap());
     }
 
     #[test]
@@ -4486,22 +4875,13 @@ mod tests {
         let classes: BTreeMap<String, schema::RedClass> =
             serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
         let class_names: BTreeSet<String> = classes.keys().cloned().collect();
-        let missing_dll = OsStr::new("missing-kraken.dll");
-        let mut document = codec::decode_wkit(&fixture, &class_names, missing_dll).unwrap();
+        let mut document = codec::decode_wkit(&fixture, &class_names).unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let json_path = workspace.path().join("fixture.json");
         let output_path = workspace.path().join("roundtrip.cr2w");
         fs::write(&json_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
 
-        write_with_template(
-            &json_path,
-            &fixture,
-            &output_path,
-            &class_names,
-            &classes,
-            missing_dll,
-        )
-        .unwrap();
+        write_with_template(&json_path, &fixture, &output_path, &class_names, &classes).unwrap();
 
         assert_eq!(fs::read(&output_path).unwrap(), fs::read(&fixture).unwrap());
 
@@ -4515,16 +4895,8 @@ mod tests {
             .unwrap();
         *target = serde_json::Value::String(replacement.clone());
         fs::write(&json_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-        write_with_template(
-            &json_path,
-            &fixture,
-            &output_path,
-            &class_names,
-            &classes,
-            missing_dll,
-        )
-        .unwrap();
-        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+        write_with_template(&json_path, &fixture, &output_path, &class_names, &classes).unwrap();
+        let decoded = codec::decode_wkit(&output_path, &class_names).unwrap();
 
         assert_ne!(fs::read(&output_path).unwrap(), fs::read(&fixture).unwrap());
         assert_eq!(
@@ -4556,17 +4928,8 @@ mod tests {
         let class_names: BTreeSet<String> = classes.keys().cloned().collect();
         let workspace = tempfile::tempdir().unwrap();
         let output_path = workspace.path().join("pruned.cr2w");
-        let missing_dll = OsStr::new("missing-kraken.dll");
 
-        write_with_template(
-            &json_path,
-            &fixture,
-            &output_path,
-            &class_names,
-            &classes,
-            missing_dll,
-        )
-        .unwrap();
+        write_with_template(&json_path, &fixture, &output_path, &class_names, &classes).unwrap();
 
         let template_exports = cr2w::inspect(&fixture).unwrap().exports.len();
         let output = cr2w::inspect(&output_path).unwrap();
@@ -4577,7 +4940,7 @@ mod tests {
         );
         assert_eq!(output_exports, expected_exports);
         assert_eq!(output.imports.len(), expected_imports);
-        codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+        codec::decode_wkit(&output_path, &class_names).unwrap();
     }
 
     #[test]
@@ -4594,19 +4957,10 @@ mod tests {
         let authored: Value = serde_json::from_slice(&fs::read(&json_path).unwrap()).unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let output_path = workspace.path().join("authored-handles.cr2w");
-        let missing_dll = OsStr::new("missing-kraken.dll");
 
-        write_with_template(
-            &json_path,
-            &fixture,
-            &output_path,
-            &class_names,
-            &classes,
-            missing_dll,
-        )
-        .unwrap();
+        write_with_template(&json_path, &fixture, &output_path, &class_names, &classes).unwrap();
 
-        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+        let decoded = codec::decode_wkit(&output_path, &class_names).unwrap();
         let authored_nodes = authored
             .pointer("/Data/RootChunk/graph/Data/nodes")
             .and_then(Value::as_array)
@@ -4670,18 +5024,9 @@ mod tests {
         let authored: Value = serde_json::from_slice(&fs::read(&json_path).unwrap()).unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let output_path = workspace.path().join("scalar.cr2w");
-        let missing_dll = OsStr::new("missing-kraken.dll");
 
-        write_with_template(
-            &json_path,
-            &fixture,
-            &output_path,
-            &class_names,
-            &classes,
-            missing_dll,
-        )
-        .unwrap();
-        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+        write_with_template(&json_path, &fixture, &output_path, &class_names, &classes).unwrap();
+        let decoded = codec::decode_wkit(&output_path, &class_names).unwrap();
 
         let active = "/Data/RootChunk/nodes/2/Data/communitiesData/0/entriesInitialState/0/entryActiveOnStart";
         assert_eq!(
@@ -4717,18 +5062,9 @@ mod tests {
         let class_names: BTreeSet<String> = classes.keys().cloned().collect();
         let workspace = tempfile::tempdir().unwrap();
         let output_path = workspace.path().join("redpackage.streamingsector");
-        let missing_dll = OsStr::new("missing-kraken.dll");
 
-        write_with_template(
-            &json_path,
-            &fixture,
-            &output_path,
-            &class_names,
-            &classes,
-            missing_dll,
-        )
-        .unwrap();
-        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+        write_with_template(&json_path, &fixture, &output_path, &class_names, &classes).unwrap();
+        let decoded = codec::decode_wkit(&output_path, &class_names).unwrap();
         let json = serde_json::to_string(&decoded).unwrap();
         for expected in [
             "ComputerControllerPS",
@@ -4755,22 +5091,13 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let json_path = workspace.path().join("grown.json");
         let output_path = workspace.path().join("grown.streamingsector");
-        let missing_dll = OsStr::new("missing-kraken.dll");
         let mut document: Value = serde_json::from_slice(&fs::read(source_path).unwrap()).unwrap();
 
         assert!(grow_files_structure(&mut document));
         fs::write(&json_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-        write_with_template(
-            &json_path,
-            &fixture,
-            &output_path,
-            &class_names,
-            &classes,
-            missing_dll,
-        )
-        .unwrap();
+        write_with_template(&json_path, &fixture, &output_path, &class_names, &classes).unwrap();
 
-        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+        let decoded = codec::decode_wkit(&output_path, &class_names).unwrap();
         assert!(
             serde_json::to_string(&decoded)
                 .unwrap()
@@ -4839,61 +5166,4 @@ mod tests {
             _ => false,
         }
     }
-}
-
-/// Creates a CR2W resource directly from JSON and reflection metadata.
-///
-/// # Errors
-/// Returns an error for invalid references, unsupported custom data or I/O.
-pub fn write(input: &Path, output: &Path, schema: &RedSchema) -> Result<(), WriterError> {
-    let document = read_json(input)?;
-    let file = empty_file();
-    let classes = schema.class_names();
-    let encoder = Encoder::new_document(&file, &classes, schema, false);
-    let root = document
-        .pointer("/Data/RootChunk")
-        .ok_or_else(|| unsupported("missing root"))?;
-    encoder.document_chunks.borrow_mut().push(root.clone());
-    encoder.discover_class_handles(root)?;
-    let bytes = encoder.encode_container(&document)?;
-    fs::write(output, bytes)?;
-    Ok(())
-}
-
-fn empty_file() -> Cr2wInspection {
-    Cr2wInspection {
-        header: cr2w::Cr2wHeader {
-            version: 195,
-            flags: 0,
-            timestamp: 0,
-            build_version: 0,
-            objects_end: 0,
-            buffers_end: 0,
-            crc32: 0,
-            chunk_count: 0,
-            tables: vec![],
-        },
-        strings: vec![],
-        names: vec![],
-        imports: vec![],
-        exports: vec![],
-        buffers: vec![],
-        embedded: vec![],
-    }
-}
-
-fn kind(value: &Value) -> Result<&str, WriterError> {
-    value
-        .get("$type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| unsupported("missing class type"))
-}
-fn array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], WriterError> {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .ok_or_else(|| unsupported(format!("missing array {key}")))
-}
-fn u32n(value: usize) -> Result<u32, WriterError> {
-    u32::try_from(value).map_err(|_| WriterError::TooLarge)
 }
